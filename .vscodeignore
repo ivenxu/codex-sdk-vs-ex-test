@@ -1,0 +1,8 @@
+.vscode/**
+src/**
+tsconfig.json
+node_modules/
+out/maps/
+**/*.map
+**/*.ts
+!out/**

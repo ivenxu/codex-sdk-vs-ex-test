@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# VS Code extension build output
+out/
+dist/
+*.vsix
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+*.swp
+*.swo
+
+# TypeScript
+*.tsbuildinfo

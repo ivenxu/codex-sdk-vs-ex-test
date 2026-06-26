@@ -1,0 +1,94 @@
+{
+	"name": "codex-sdk-vs-ex-test",
+	"displayName": "Codex Chat Participant (POC)",
+	"description": "POC: CodexAppServer as a VS Code chat participant — streams responses, preserves sessions across turns, and bridges tool approvals.",
+	"version": "0.0.1",
+	"publisher": "poc",
+	"engines": {
+		"vscode": "^1.100.0"
+	},
+	"categories": [
+		"AI"
+	],
+	"activationEvents": [
+		"onChatParticipant:codex.participant",
+		"onChatParticipant:copilot-cli.participant",
+		"onChatParticipant:claude.participant",
+		"onLanguageModelChatProvider:codex",
+		"onLanguageModelChatProvider:claude-code"
+	],
+	"enabledApiProposals": [
+		"chatProvider"
+	],
+	"main": "./out/extension.js",
+	"contributes": {
+		"languageModelChatProviders": [
+			{
+				"vendor": "codex",
+				"displayName": "Codex (OpenAI)"
+			},
+			{
+				"vendor": "claude-code",
+				"displayName": "Claude Code"
+			}
+		],
+		"chatParticipants": [
+			{
+				"id": "codex.participant",
+				"name": "codex",
+				"description": "Codex AI agent — edits files, runs commands, and explores your codebase",
+				"isSticky": true
+			},
+			{
+				"id": "copilot-cli.participant",
+				"name": "copilot-cli",
+				"description": "GitHub Copilot CLI agent — coding and terminal tasks via Copilot CLI",
+				"isSticky": true
+			},
+			{
+				"id": "claude.participant",
+				"name": "claude",
+				"description": "Claude Code agent — edits files, runs commands, and explores your codebase",
+				"isSticky": true
+			}
+		],
+		"configuration": {
+			"title": "AI Agents",
+			"properties": {
+				"codex.binaryPath": {
+					"type": "string",
+					"default": "",
+					"description": "Absolute path to the codex binary. Leave empty to auto-discover via PATH."
+				},
+				"copilot.binaryPath": {
+					"type": "string",
+					"default": "",
+					"description": "Absolute path to the GitHub Copilot CLI binary. Leave empty to auto-discover via PATH."
+				},
+				"claude.binaryPath": {
+					"type": "string",
+					"default": "",
+					"description": "Absolute path to the Claude Code binary. Leave empty to auto-discover via PATH."
+				}
+			}
+		}
+	},
+	"scripts": {
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"lint": "eslint src --ext ts"
+	},
+	"dependencies": {
+		"@anthropic-ai/claude-agent-sdk": "^0.3.169",
+		"@github/copilot-sdk": "^1.0.1"
+	},
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"@types/vscode": "^1.100.0",
+		"typescript": "^5.4.0"
+	},
+	"dependencies": {
+		"@anthropic-ai/claude-agent-sdk": "^0.3.193",
+		"@github/copilot-sdk": "^1.0.4"
+	}
+}
