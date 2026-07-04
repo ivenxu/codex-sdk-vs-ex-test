@@ -113,3 +113,28 @@ declare module 'vscode' {
 		};
 	}
 }
+
+// ── chatParticipantAdditions: thinkingProgress & ThinkingDelta ────────────────
+
+declare module 'vscode' {
+
+	/**
+	 * A contribution to the chat thinking panel. Unlike markdown, content sent
+	 * via thinkingProgress renders in a collapsible thinking block that the user
+	 * can expand or dismiss.
+	 */
+	export type ThinkingDelta =
+		| { text?: string | string[]; id: string; metadata?: { readonly [key: string]: any } }
+		| { text?: string | string[]; id?: string; metadata: { readonly [key: string]: any } }
+		| { text: string | string[]; id?: string; metadata?: { readonly [key: string]: any } };
+
+	export interface ChatResponseStream {
+		/**
+		 * Stream a thinking / reasoning delta. Content is rendered in a
+		 * collapsible thinking block inside the chat response.
+		 *
+		 * **Proposed API** — requires `chatParticipantAdditions`.
+		 */
+		thinkingProgress(thinkingDelta: ThinkingDelta): void;
+	}
+}

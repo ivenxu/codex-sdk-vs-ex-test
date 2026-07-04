@@ -121,6 +121,7 @@ export class AppServerClient extends EventEmitter {
 
 		const id = ++this.requestId;
 		const message: JSONRPCRequest = { method, id, params };
+		console.log('[app-server] → request', JSON.stringify({ method, id, params }).slice(0, 300));
 
 		return new Promise((resolve, reject) => {
 			this.pendingRequests.set(id, { resolve, reject });
@@ -137,12 +138,14 @@ export class AppServerClient extends EventEmitter {
 	/** Send a JSON-RPC notification (fire-and-forget). */
 	notify(method: string, params?: unknown): void {
 		if (!this.process?.stdin) { return; }
+		console.log('[app-server] → notify', method);
 		this.process.stdin.write(JSON.stringify({ method, params }) + '\n');
 	}
 
 	/** Respond to a server-initiated request (e.g. an approval). */
 	respond(id: string | number, result: unknown): void {
 		if (!this.process?.stdin) { return; }
+		console.log('[app-server] → respond id=', id, JSON.stringify(result).slice(0, 200));
 		this.process.stdin.write(JSON.stringify({ id, result }) + '\n');
 	}
 

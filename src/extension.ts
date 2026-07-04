@@ -3,6 +3,7 @@ import { CodexParticipant } from './codexParticipant';
 import { CopilotParticipant } from './copilotParticipant';
 import { ClaudeParticipant } from './claudeParticipant';
 import { ProxyManager } from './proxy/index';
+import { DynamicToolManager } from './tools/dynamicToolManager';
 import { registerCodexModels } from './codexModelProvider';
 import { registerClaudeModels } from './claudeModelProvider';
 
@@ -15,13 +16,21 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	// Start LM proxy servers (OpenAI Responses + Anthropic Messages)
 	const proxyManager = new ProxyManager();
-	proxyManager.start().then(info => {
+	const proxyReady = proxyManager.start();
+	proxyReady.then(info => {
 		console.log(`[proxy] responses: ${info.responsesUrl}  messages: ${info.messagesUrl}`);
 	});
 	context.subscriptions.push({ dispose: () => proxyManager.dispose() });
 
+	// Dynamic tool discovery (vscode.lm.tools → Codex dynamicTools)
+	const toolManager = new DynamicToolManager();
+	context.subscriptions.push(vscode.commands.registerCommand('codex.clearDynamicToolCache', () => {
+		toolManager.clearCache();
+		vscode.window.showInformationMessage('Codex: Dynamic tool cache cleared');
+	}));
+
 	// ── @codex participant ──────────────────────────────────────────────────
-	const codexParticipant = new CodexParticipant(proxyManager);
+	const codexParticipant = new CodexParticipant(proxyManager, toolManager);
 	const codexChat = vscode.chat.createChatParticipant(
 		'codex.participant',
 		codexParticipant.handleRequest.bind(codexParticipant)

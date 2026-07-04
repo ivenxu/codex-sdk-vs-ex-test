@@ -21,7 +21,7 @@ interface ResponsesContentPart {
 
 interface ResponsesMessageItem {
 	type: 'message';
-	role: 'user' | 'assistant' | 'system';
+	role: 'user' | 'assistant' | 'system' | 'developer';
 	content: ResponsesContentPart[];
 }
 
@@ -59,10 +59,39 @@ interface ResponsesFunctionTool {
 	strict?: boolean;
 }
 
+interface ResponsesNamespaceTool {
+	type: 'function';
+	name: string;
+	description?: string;
+	parameters?: object;
+	strict?: boolean;
+}
+
+interface ResponsesNamespace {
+	type: 'namespace';
+	name: string;
+	description?: string;
+	tools: ResponsesNamespaceTool[];
+}
+
+/**
+ * The Responses API supports several other `type` values
+ * (`tool_search`, `web_search`, `image_generation`, `freeform`, …) that
+ * have no VS Code LM API equivalent. Model the open-ended field as
+ * `{ type: string }` so unknown values don't get erased by the type
+ * checker and are caught by the dropped-types warning instead.
+ */
+interface ResponsesUnknownTool {
+	type: string;
+	[key: string]: unknown;
+}
+
+type ResponsesToolEntry = ResponsesFunctionTool | ResponsesNamespace | ResponsesUnknownTool;
+
 interface ResponsesRequest {
 	model: string;
 	input: ResponsesInputItem[];
-	tools?: ResponsesFunctionTool[];
+	tools?: ResponsesToolEntry[];
 	stream?: boolean;
 	max_output_tokens?: number;
 	reasoning?: { effort?: string; summary?: string };
@@ -89,6 +118,20 @@ function convertContentPart(part: ResponsesContentPart): vscode.LanguageModelTex
 }
 
 export function convertInputToMessages(input: ResponsesInputItem[]): vscode.LanguageModelChatMessage[] {
+	// First pass: index tool results by call_id so we can pair them with tool
+	// calls even when assistant messages are interleaved between calls and outputs.
+	// OpenAI Responses API allows arbitrary interleaving; VS Code LM API requires
+	// every Assistant[toolCall] message to be immediately followed by a User message
+	// containing the matching tool results.
+	const pendingResults = new Map<string, ResponsesFunctionCallOutputItem>();
+	for (const item of input) {
+		if (item.type === 'function_call_output') {
+			const fco = item as ResponsesFunctionCallOutputItem;
+			pendingResults.set(fco.call_id, fco);
+		}
+	}
+	const consumedResults = new Set<string>();
+
 	const messages: vscode.LanguageModelChatMessage[] = [];
 	let i = 0;
 
@@ -103,51 +146,66 @@ export function convertInputToMessages(input: ResponsesInputItem[]): vscode.Lang
 
 		if (item.type === 'message') {
 			const msg = item as ResponsesMessageItem;
-			if (msg.role === 'user' || msg.role === 'system') {
-				// system role has no VS Code equivalent — treat as User so it doesn't start as Assistant
-				const parts = msg.content.map(convertContentPart).filter((p): p is vscode.LanguageModelTextPart => p !== undefined);
+			const parts = msg.content.map(convertContentPart).filter((p): p is vscode.LanguageModelTextPart => p !== undefined);
+			if (msg.role === 'user' || msg.role === 'system' || msg.role === 'developer') {
+				// developer/system roles have no VS Code equivalent — treat as User so
+				// the conversation doesn't start with an Assistant message.
 				messages.push(vscode.LanguageModelChatMessage.User(parts.length > 0 ? parts : ''));
-				i++;
 			} else {
-				// Assistant message — collect text parts plus any immediately-following function_calls
-				const parts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart> = [];
-				for (const c of msg.content) {
-					const p = convertContentPart(c);
-					if (p) { parts.push(p); }
-				}
-				i++;
-				// Consume following function_call items and merge into this assistant message
-				while (i < input.length && input[i].type === 'function_call') {
-					const fc = input[i] as ResponsesFunctionCallItem;
-					let parsedArgs: object;
-					try { parsedArgs = JSON.parse(fc.arguments) as object; } catch { parsedArgs = {}; }
-					parts.push(new vscode.LanguageModelToolCallPart(fc.call_id, fc.name, parsedArgs));
-					i++;
-				}
 				messages.push(vscode.LanguageModelChatMessage.Assistant(parts.length > 0 ? parts : ''));
 			}
+			i++;
 		} else if (item.type === 'function_call') {
-			// Standalone function_call(s) without a preceding assistant message
-			const parts: vscode.LanguageModelToolCallPart[] = [];
+			// Collect consecutive function_call items.
+			const toolParts: vscode.LanguageModelToolCallPart[] = [];
 			while (i < input.length && input[i].type === 'function_call') {
 				const fc = input[i] as ResponsesFunctionCallItem;
 				let parsedArgs: object;
 				try { parsedArgs = JSON.parse(fc.arguments) as object; } catch { parsedArgs = {}; }
-				parts.push(new vscode.LanguageModelToolCallPart(fc.call_id, fc.name, parsedArgs));
+				toolParts.push(new vscode.LanguageModelToolCallPart(fc.call_id, fc.name, parsedArgs));
 				i++;
 			}
-			messages.push(vscode.LanguageModelChatMessage.Assistant(parts));
+
+			// Look up the matching results by call_id and emit them immediately after
+			// the tool calls, regardless of where they appear in the input array.
+			const resultParts: vscode.LanguageModelToolResultPart[] = [];
+			for (const tc of toolParts) {
+				const fco = pendingResults.get(tc.callId);
+				if (fco) {
+					resultParts.push(new vscode.LanguageModelToolResultPart(fco.call_id, [
+						new vscode.LanguageModelTextPart(fco.output),
+					]));
+					consumedResults.add(fco.call_id);
+				}
+			}
+
+			if (toolParts.length > 0) {
+				messages.push(vscode.LanguageModelChatMessage.Assistant(toolParts));
+			}
+			if (resultParts.length > 0) {
+				messages.push(vscode.LanguageModelChatMessage.User(resultParts));
+			}
 		} else if (item.type === 'function_call_output') {
-			// Tool results → user message; group consecutive outputs together
+			const fco = item as ResponsesFunctionCallOutputItem;
+			if (consumedResults.has(fco.call_id)) {
+				// Already emitted when its matching function_call was processed.
+				i++;
+				continue;
+			}
+			// Orphan output without a matching function_call in the input.
 			const results: vscode.LanguageModelToolResultPart[] = [];
 			while (i < input.length && input[i].type === 'function_call_output') {
-				const fco = input[i] as ResponsesFunctionCallOutputItem;
-				results.push(new vscode.LanguageModelToolResultPart(fco.call_id, [
-					new vscode.LanguageModelTextPart(fco.output),
-				]));
+				const fco2 = input[i] as ResponsesFunctionCallOutputItem;
+				if (!consumedResults.has(fco2.call_id)) {
+					results.push(new vscode.LanguageModelToolResultPart(fco2.call_id, [
+						new vscode.LanguageModelTextPart(fco2.output),
+					]));
+				}
 				i++;
 			}
-			messages.push(vscode.LanguageModelChatMessage.User(results));
+			if (results.length > 0) {
+				messages.push(vscode.LanguageModelChatMessage.User(results));
+			}
 		} else {
 			i++;
 		}
@@ -167,14 +225,202 @@ export function convertInputToMessages(input: ResponsesInputItem[]): vscode.Lang
 // Tools conversion
 // ---------------------------------------------------------------------------
 
-function convertTools(tools: ResponsesFunctionTool[]): vscode.LanguageModelChatTool[] {
-	return tools
-		.filter(t => t.type === 'function' && t.name)
-		.map(t => ({
-			name: t.name,
-			description: t.description ?? '',
-			inputSchema: t.parameters as Record<string, unknown> ?? {},
-		}));
+/**
+ * Result of converting Responses API `tools[]` to the VS Code LM API shape.
+ *
+ * `tools` — the flattened LM tool list (namespaces are inlined as `ns__name`).
+ * `nameToNs` — maps a flat name back to its original `{ namespace, name }`
+ * pair, or `null` if the tool was never a namespace child. Namespace tools
+ * must be re-split when serializing function calls in the SSE output so
+ * Codex matches the original `ToolName { namespace, name }` registration.
+ */
+const HARD_TOOL_LIMIT = 128;
+const HIGH_PRIORITY_TOOL_NAMES = new Set([
+	'readFile',
+	'writeFile',
+	'replaceInFile',
+	'listDirectory',
+	'fileSearch',
+	'searchContent',
+	'vscode_editFile_internal',
+	'vscode_editFile',
+	'copilot_editFiles',
+	'runInTerminal',
+	'exec_command',
+	'create_directory',
+	'get_terminal_output',
+	'manage_todo_list',
+]);
+
+interface ConvertedTools {
+	tools: vscode.LanguageModelChatTool[];
+	/** Maps flat name → `{ namespace, name }`, or `null` for top-level tools. */
+	nameToNs: Map<string, { namespace: string; name: string } | null>;
+}
+
+function extractQueryText(messages: vscode.LanguageModelChatMessage[]): string {
+	return messages
+		.filter(m => m.role === 1)
+		.map(m => {
+			if (typeof m.content === 'string') {
+				return m.content;
+			}
+			return m.content
+				.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : '')
+				.join(' ');
+		})
+		.join(' ');
+}
+
+function scoreToolRelevance(tool: vscode.LanguageModelChatTool, query: string): number {
+	const queryLower = query.toLowerCase();
+	const nameLower = tool.name.toLowerCase();
+	const descLower = (tool.description ?? '').toLowerCase();
+	let score = 0;
+
+	if (HIGH_PRIORITY_TOOL_NAMES.has(tool.name)) {
+		score += 50;
+	}
+
+	if (queryLower.includes(nameLower)) {
+		score += 10;
+	}
+
+	const keywordGroups: Array<{ keywords: string[]; nameKeywords: string[]; bonus: number }> = [
+		{ keywords: ['create', 'write', 'save', 'new', 'make'], nameKeywords: ['create', 'write', 'save'], bonus: 10 },
+		{ keywords: ['read', 'show', 'display', 'get', 'open'], nameKeywords: ['read', 'get', 'list', 'show', 'open'], bonus: 8 },
+		{ keywords: ['edit', 'modify', 'change', 'update', 'replace'], nameKeywords: ['edit', 'replace', 'apply', 'insert'], bonus: 10 },
+		{ keywords: ['search', 'find', 'lookup', 'grep'], nameKeywords: ['search', 'find', 'grep'], bonus: 8 },
+		{ keywords: ['terminal', 'command', 'run', 'execute', 'shell'], nameKeywords: ['terminal', 'run', 'execute', 'shell'], bonus: 8 },
+	];
+
+	for (const group of keywordGroups) {
+		if (group.keywords.some(keyword => queryLower.includes(keyword))) {
+			if (group.nameKeywords.some(keyword => nameLower.includes(keyword))) {
+				score += group.bonus;
+			}
+		}
+	}
+
+	if (descLower) {
+		for (const word of queryLower.split(/\s+/)) {
+			if (word.length > 3 && descLower.includes(word)) {
+				score += 1;
+			}
+		}
+	}
+
+	return score;
+}
+
+function filterTools(tools: vscode.LanguageModelChatTool[], query: string, maxTools: number = HARD_TOOL_LIMIT): vscode.LanguageModelChatTool[] {
+	if (tools.length <= maxTools) {
+		return tools;
+	}
+
+	const scored = tools.map(tool => ({ tool, score: scoreToolRelevance(tool, query) }));
+	scored.sort((a, b) => b.score - a.score || a.tool.name.localeCompare(b.tool.name));
+
+	const selected = scored.slice(0, maxTools).map(entry => entry.tool);
+	const dropped = scored.slice(maxTools).map(entry => entry.tool.name);
+	console.warn(`[responses-proxy] filtered ${tools.length} tools down to ${maxTools}; dropped ${dropped.length} tools: ${dropped.slice(0, 20).join(', ')}${dropped.length > 20 ? ', ...' : ''}`);
+	return selected;
+}
+
+/**
+ * Convert OpenAI Responses API `tools[]` entries to VS Code LM API
+ * `LanguageModelChatTool[]` with a bidirectional name map for the SSE round-trip.
+ *
+ * The Responses API supports a richer tool vocabulary than the VS Code LM
+ * API's flat `LanguageModelChatTool`:
+ *
+ * - `{"type":"function", name, description, parameters, strict}` — direct
+ * - `{"type":"namespace", name, description, tools: [...]}` — a folder of
+ *   related functions (Codex multi-agent tools, MCP namespaces, etc.)
+ * - `{"type":"tool_search", ...}` — deferred-tool discovery shim
+ * - `{"type":"web_search", ...}` / `{"type":"image_generation", ...}` —
+ *   hosted Responses tools (no LM-API equivalent, drop with a warning)
+ *
+ * VS Code's `LanguageModelChatTool` has no namespace concept, so we flatten
+ * namespace children to `ns__tool` names using the same double-underscore
+ * separator Codex uses for MCP tool names. The reverse map lets the SSE
+ * output split them back to `namespace`/`name` so `ToolRouter::build_tool_call`
+ * matches the original dynamic tool registration.
+ */
+function convertTools(tools: ResponsesToolEntry[]): ConvertedTools {
+	const out: vscode.LanguageModelChatTool[] = [];
+	const nameToNs = new Map<string, { namespace: string; name: string } | null>();
+	const droppedTypes: Record<string, number> = {};
+
+	for (const t of tools) {
+		if (!t || typeof t !== 'object') { continue; }
+		// Read `type` as a local string so the union narrowing below can
+		// distinguish known vs unknown tool shapes without erasing the
+		// open-ended field.
+		const toolType = typeof t.type === 'string' ? t.type : '';
+
+		if (toolType === 'function') {
+			const fn = t as ResponsesFunctionTool;
+			if (!fn.name) { continue; }
+			out.push({
+				name: fn.name,
+				description: fn.description ?? '',
+				inputSchema: (fn.parameters && typeof fn.parameters === 'object'
+					? (fn.parameters as Record<string, unknown>)
+					: {}),
+			});
+			// Not a namespace tool — record as top-level.
+			nameToNs.set(fn.name, null);
+			continue;
+		}
+
+		if (toolType === 'namespace') {
+			const ns = t as ResponsesNamespace;
+			const nsName = ns.name || 'ns';
+			for (const child of ns.tools ?? []) {
+				if (!child || child.type !== 'function' || !child.name) { continue; }
+				const flatName = `${nsName}__${child.name}`;
+				out.push({
+					name: flatName,
+					description: child.description ?? ns.description ?? '',
+					inputSchema: (child.parameters && typeof child.parameters === 'object'
+						? (child.parameters as Record<string, unknown>)
+						: {}),
+				});
+				nameToNs.set(flatName, { namespace: nsName, name: child.name });
+			}
+			continue;
+		}
+
+		// Other tool types (tool_search, web_search, image_generation, freeform)
+		// have no VS Code LM API equivalent — count and drop with a warning.
+		if (toolType) {
+			droppedTypes[toolType] = (droppedTypes[toolType] ?? 0) + 1;
+		}
+	}
+
+	if (Object.keys(droppedTypes).length > 0) {
+		console.warn(`[responses-proxy] dropped unsupported tool types:`, droppedTypes);
+	}
+
+	return { tools: out, nameToNs };
+}
+
+/**
+ * Given a flat tool name from the LM, return the `{ namespace, name }` pair
+ * for the SSE `function_call` output. Returns `null` for top-level tools
+ * (no namespace).
+ */
+function splitToolName(
+	nameToNs: Map<string, { namespace: string; name: string } | null>,
+	flatName: string,
+): { namespace?: string; name: string } {
+	const mapped = nameToNs.get(flatName);
+	if (mapped) {
+		return { namespace: mapped.namespace, name: mapped.name };
+	}
+	// Fallback: unknown tool name, emit as plain top-level name.
+	return { name: flatName };
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +431,7 @@ async function streamResponsesSSE(
 	res: http.ServerResponse,
 	vsResponse: vscode.LanguageModelChatResponse,
 	modelId: string,
+	nameToNs: Map<string, { namespace: string; name: string } | null>,
 	token: vscode.CancellationToken,
 ): Promise<void> {
 	const responseId = makeId('resp');
@@ -245,6 +492,12 @@ async function streamResponsesSSE(
 		});
 	};
 
+	// Track reasoning item state
+	let reasoningItemId: string | null = null;
+	let reasoningOutputIndex = 0;
+	let reasoningSummaryIndex = 0;
+	let reasoningContentIndex = 0;
+
 	// Track tool call output items
 	const toolCallItems: Array<{ id: string; call_id: string; name: string; arguments: string; output_index: number }> = [];
 	outputIndex++; // tool calls start at outputIndex 1+
@@ -253,6 +506,7 @@ async function streamResponsesSSE(
 	let usageOutputTokens = 0;
 	let stopReason = 'stop';
 	let partCount = 0;
+	let streamError: Error | null = null;
 
 	try {
 		for await (const part of vsResponse.stream) {
@@ -283,6 +537,7 @@ async function streamResponsesSSE(
 				stopReason = 'tool_calls';
 
 				const toolPart = part as vscode.LanguageModelToolCallPart;
+				const resolved = splitToolName(nameToNs, toolPart.name);
 				const toolItemId = makeId('fc');
 				const toolOutputIndex = outputIndex++;
 				const argsJson = JSON.stringify(toolPart.input);
@@ -290,7 +545,7 @@ async function streamResponsesSSE(
 				writeSSEEvent(res, {
 					type: 'response.output_item.added',
 					output_index: toolOutputIndex,
-					item: { id: toolItemId, type: 'function_call', status: 'in_progress', call_id: part.callId, name: part.name, arguments: '' },
+					item: { id: toolItemId, type: 'function_call', status: 'in_progress', call_id: part.callId, name: resolved.name, namespace: resolved.namespace, arguments: '' },
 				});
 				writeSSEEvent(res, {
 					type: 'response.function_call_arguments.delta',
@@ -302,12 +557,14 @@ async function streamResponsesSSE(
 					type: 'response.function_call_arguments.done',
 					item_id: toolItemId,
 					output_index: toolOutputIndex,
+					name: resolved.name,
+					namespace: resolved.namespace,
 					arguments: argsJson,
 				});
 				writeSSEEvent(res, {
 					type: 'response.output_item.done',
 					output_index: toolOutputIndex,
-					item: { id: toolItemId, type: 'function_call', status: 'completed', call_id: toolPart.callId, name: toolPart.name, arguments: argsJson },
+					item: { id: toolItemId, type: 'function_call', status: 'completed', call_id: toolPart.callId, name: resolved.name, namespace: resolved.namespace, arguments: argsJson },
 				});
 
 				toolCallItems.push({ id: toolItemId, call_id: toolPart.callId, name: toolPart.name, arguments: argsJson, output_index: toolOutputIndex });
@@ -322,16 +579,58 @@ async function streamResponsesSSE(
 					} catch { /* ignore */ }
 				}
 			} else if (isThinking) {
-				// Thinking parts dropped — codex manages its own reasoning state
+				// Forward thinking parts as reasoning content deltas.
+				// Codex's SSE parser REQUIRES `content_index` in
+				// `response.reasoning_text.delta` — without it the
+				// event is silently dropped (codex-api/src/sse/responses.rs:351).
+				const thinkingPart = part as { value?: string };
+				const thinkingText = thinkingPart.value ?? '';
+				if (thinkingText) {
+					console.log(`[responses-proxy] reasoning_text.delta ci=${reasoningContentIndex}:`, thinkingText.slice(0, 80));
+					writeSSEEvent(res, {
+						type: 'response.reasoning_text.delta',
+						delta: thinkingText,
+						content_index: reasoningContentIndex++,
+					});
+				}
 			}
 		}
 	} catch (streamErr) {
 		console.error('[responses-proxy] stream error:', streamErr);
+		streamError = streamErr instanceof Error ? streamErr : new Error(String(streamErr));
 	}
 	console.log(`[responses-proxy] stream iteration done, total parts=${partCount ?? 0}`);
 
 	// Phase 3: Close message item
 	closeTextContent();
+
+	// If there was a stream error, send a failed response
+	if (streamError) {
+		writeSSEEvent(res, {
+			type: 'response.failed',
+			response: {
+				id: responseId,
+				object: 'realtime.response',
+				status: 'failed',
+				model: modelId,
+				output: [],
+				error: {
+					type: 'server_error',
+					code: 'stream_error',
+					message: streamError.message,
+				},
+				usage: {
+					input_tokens: usageInputTokens,
+					output_tokens: usageOutputTokens,
+					total_tokens: usageInputTokens + usageOutputTokens,
+					output_tokens_details: { reasoning_tokens: 0 },
+				},
+			},
+		});
+		console.log(`[responses-proxy] stream failed — error: ${streamError.message}`);
+		res.end();
+		return;
+	}
 
 	const outputContent = accumulatedText
 		? [{ type: 'output_text', text: accumulatedText, annotations: [] }]
@@ -379,12 +678,14 @@ async function streamResponsesSSE(
 async function collectResponsesResponse(
 	vsResponse: vscode.LanguageModelChatResponse,
 	modelId: string,
+	nameToNs: Map<string, { namespace: string; name: string } | null>,
 	token: vscode.CancellationToken,
 ): Promise<object> {
 	const responseId = makeId('resp');
 	const messageItemId = makeId('msg');
 	let text = '';
-	const toolCalls: Array<{ id: string; call_id: string; name: string; arguments: string }> = [];
+	const toolCalls: Array<{ id: string; call_id: string; namespace?: string; name: string; arguments: string }> = [];
+	let streamError: Error | null = null;
 
 	try {
 		for await (const part of vsResponse.stream) {
@@ -392,10 +693,31 @@ async function collectResponsesResponse(
 			if (part instanceof vscode.LanguageModelTextPart) {
 				text += part.value;
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
-				toolCalls.push({ id: makeId('fc'), call_id: part.callId, name: part.name, arguments: JSON.stringify(part.input) });
+				const resolved = splitToolName(nameToNs, part.name);
+				toolCalls.push({ id: makeId('fc'), call_id: part.callId, namespace: resolved.namespace, name: resolved.name, arguments: JSON.stringify(part.input) });
 			}
 		}
-	} catch { /* ignore */ }
+	} catch (err) {
+		console.error('[responses-proxy] collect stream error:', err);
+		streamError = err instanceof Error ? err : new Error(String(err));
+	}
+
+	// If there was a stream error, return a failed response object
+	if (streamError) {
+		return {
+			id: responseId,
+			object: 'realtime.response',
+			status: 'failed',
+			model: modelId,
+			output: [],
+			error: {
+				type: 'server_error',
+				code: 'stream_error',
+				message: streamError.message,
+			},
+			usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+		};
+	}
 
 	const output: unknown[] = [];
 	const content: unknown[] = [];
@@ -405,7 +727,9 @@ async function collectResponsesResponse(
 		output.push({ id: messageItemId, type: 'message', status: 'completed', role: 'assistant', content });
 	}
 	for (const tc of toolCalls) {
-		output.push({ id: tc.id, type: 'function_call', status: 'completed', call_id: tc.call_id, name: tc.name, arguments: tc.arguments });
+		const fc: Record<string, unknown> = { id: tc.id, type: 'function_call', status: 'completed', call_id: tc.call_id, name: tc.name, arguments: tc.arguments };
+		if (tc.namespace) { fc.namespace = tc.namespace; }
+		output.push(fc);
 	}
 
 	return {
@@ -446,16 +770,56 @@ export function createResponsesHandler(): RouteHandler {
 		const model = models.find(m => m.vendor === 'copilot') ?? models[0];
 
 		const messages = convertInputToMessages(req.input);
+		console.log(`[responses-proxy] input items (${req.input.length}):`, req.input.map((it: ResponsesInputItem, idx) => `${idx}:${it.type}${it.type === 'function_call' ? '(call_id=' + (it as ResponsesFunctionCallItem).call_id + ')' : ''}${it.type === 'function_call_output' ? '(call_id=' + (it as ResponsesFunctionCallOutputItem).call_id + ')' : ''}${it.type === 'message' ? '(' + (it as ResponsesMessageItem).role + ')' : ''}`));
+		console.log(`[responses-proxy] converted messages (${messages.length}):`, messages.map((m, idx) => {
+			let roleName = 'unknown';
+			if (m.role === 1) { roleName = 'User'; }
+			if (m.role === 2) { roleName = 'Assistant'; }
+			if (typeof m.content === 'string') { return `${idx}:${roleName}[text]`; }
+			const partsDesc = m.content.map((p: unknown) => {
+				if (p instanceof vscode.LanguageModelTextPart) { return `text("${p.value.slice(0, 40)}")`; }
+				if (p instanceof vscode.LanguageModelToolCallPart) { return `toolCall(${p.callId}, ${p.name})`; }
+				if (p instanceof vscode.LanguageModelToolResultPart) { return `toolResult(${p.callId})`; }
+				return typeof p;
+			}).join(', ');
+			return `${idx}:${roleName}[${partsDesc}]`;
+		}));
 		if (messages.length === 0) {
 			writeJSON(res, 400, { error: { type: 'invalid_request_error', message: 'No messages could be derived from `input`' } });
 			return;
 		}
 
 		const options: vscode.LanguageModelChatRequestOptions = {};
+		let nameToNs = new Map<string, { namespace: string; name: string } | null>();
 		if (Array.isArray(req.tools) && req.tools.length > 0) {
-			const fns = req.tools.filter(t => t.type === 'function');
-			console.log(`[responses-proxy] tools[0] sample:`, JSON.stringify(fns[0]).slice(0, 300));
-			options.tools = convertTools(fns);
+			// Hand the full list to convertTools so namespace tools are
+			// flattened into the LM API's flat LanguageModelChatTool shape.
+			// The returned nameToNs map is used by the SSE output to
+			// reconstruct `namespace`/`name` pairs for Codex's ToolRouter.
+			const typeBreakdown: Record<string, number> = {};
+			for (const t of req.tools) {
+				if (t && typeof t === 'object' && typeof t.type === 'string') {
+					typeBreakdown[t.type] = (typeBreakdown[t.type] ?? 0) + 1;
+				}
+			}
+			console.log(`[responses-proxy] tools inbound: ${req.tools.length} (${JSON.stringify(typeBreakdown)})`);
+			const converted = convertTools(req.tools);
+			nameToNs = converted.nameToNs;
+			console.log(`[responses-proxy] tools after convert: ${converted.tools.length}`);
+			if (converted.tools.length > HARD_TOOL_LIMIT) {
+				const queryText = extractQueryText(messages);
+				const filtered = filterTools(converted.tools, queryText, HARD_TOOL_LIMIT);
+				const filteredNames = new Set(filtered.map(t => t.name));
+				nameToNs = new Map(Array.from(nameToNs.entries()).filter(([name]) => filteredNames.has(name)));
+				console.log(`[responses-proxy] filtered tools down to ${filtered.length}`);
+				options.tools = filtered;
+			} else {
+				options.tools = converted.tools;
+			}
+			if (options.tools.length > 0) {
+				console.log(`[responses-proxy] tools[0] sample:`, JSON.stringify(options.tools[0]).slice(0, 300));
+				console.log(`[responses-proxy] tools list:`, options.tools.map(t => t.name).join(', '));
+			}
 		}
 
 		const cts = new vscode.CancellationTokenSource();
@@ -468,14 +832,37 @@ export function createResponsesHandler(): RouteHandler {
 		} catch (err) {
 			console.error(`[responses-proxy] sendRequest error:`, err);
 			cts.dispose();
-			writeJSON(res, 500, { error: { type: 'server_error', message: String(err) } });
+			const errMsg = err instanceof Error ? err.message : String(err);
+			// For streaming requests, send a SSE error event instead of plain JSON
+			if (req.stream !== false) {
+				startSSE(res);
+				const responseId = makeId('resp');
+				writeSSEEvent(res, {
+					type: 'response.failed',
+					response: {
+						id: responseId,
+						object: 'realtime.response',
+						status: 'failed',
+						model: model.id,
+						output: [],
+						error: {
+							type: 'server_error',
+							code: 'send_request_failed',
+							message: errMsg,
+						},
+					},
+				});
+				res.end();
+			} else {
+				writeJSON(res, 500, { error: { type: 'server_error', message: errMsg } });
+			}
 			return;
 		}
 
 		if (req.stream !== false) {
-			await streamResponsesSSE(res, vsResponse, model.id, cts.token);
+			await streamResponsesSSE(res, vsResponse, model.id, nameToNs, cts.token);
 		} else {
-			const result = await collectResponsesResponse(vsResponse, model.id, cts.token);
+			const result = await collectResponsesResponse(vsResponse, model.id, nameToNs, cts.token);
 			writeJSON(res, 200, result);
 		}
 

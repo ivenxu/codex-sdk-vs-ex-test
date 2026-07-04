@@ -24,6 +24,7 @@ export interface ProxyInfo {
 export class ProxyManager {
 	private readonly _responses: ProxyServer;
 	private readonly _messages: ProxyServer;
+	private _startPromise: Promise<void> | null = null;
 
 	constructor() {
 		this._responses = new ProxyServer();
@@ -44,13 +45,13 @@ export class ProxyManager {
 	}
 
 	async start(): Promise<ProxyInfo> {
-		await Promise.all([this._responses.start(), this._messages.start()]);
-		return {
-			responsesUrl: this._responses.baseUrl,
-			responsesNonce: this._responses.nonce,
-			messagesUrl: this._messages.baseUrl,
-			messagesNonce: this._messages.nonce,
-		};
+		if (!this._startPromise) {
+			this._startPromise = Promise.all([this._responses.start(), this._messages.start()]).then(() => {
+				console.log(`[proxy] responses: ${this._responses.baseUrl}  messages: ${this._messages.baseUrl}`);
+			});
+		}
+		await this._startPromise;
+		return this.info;
 	}
 
 	get info(): ProxyInfo {
@@ -60,6 +61,11 @@ export class ProxyManager {
 			messagesUrl: this._messages.baseUrl,
 			messagesNonce: this._messages.nonce,
 		};
+	}
+
+	/** Returns a promise that resolves when the proxy servers are ready. */
+	get ready(): Promise<void> {
+		return this._startPromise ?? Promise.resolve();
 	}
 
 	dispose(): void {

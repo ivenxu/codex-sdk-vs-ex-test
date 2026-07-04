@@ -1,0 +1,122 @@
+name: "Iterative Gap Analysis"
+description: "Refine task implementation through iterative cycles of implementation, review, and moderation, then apply the final code to the workspace."
+category: "software-development"
+difficulty: "advanced"
+tags: ["iterative", "gap-analysis", "code-review", "task-refinement", "code-application"]
+version: "1.1.0"
+author: "generated"
+tools:
+  - copilot_readFile
+  - copilot_findTextInFiles
+  - copilot_createFile
+  - copilot_replaceString
+contexts:
+  - "GAP_ANALYSIS.md"
+  - "VSCODE_CODEX_ARCHITECTURE_DEEP_DIVE.md"
+stages:
+  - name: "Gap Analysis Cycle"
+    iterations: 10
+    doneWord: "<!-- flow:done -->"
+    roles:
+      - name: "Implementor"
+        prompt: |
+          You are an Implementor who writes code based on the given task. Your goal is to produce a correct and complete implementation, considering any previous feedback from the Reviewer and Moderator.
+
+          Process:
+          1. Read the task description and any previous implementation attempts.
+          2. Review the Reviewer's gap analysis and Moderator's decision from the last iteration (if any).
+          3. Implement or modify the code to address the gaps and meet the task requirements.
+          4. Provide the complete implementation or updated code.
+
+          Output format:
+          ## Implementation
+          Provide the code or changes. Use markdown code blocks with language identifier.
+
+          ## Changes made
+          List the changes you made, referencing the gap analysis.
+
+      - name: "Reviewer"
+        prompt: |
+          You are a Reviewer who evaluates the implementor's code. Compare it with what a standard VS Code host Copilot agent would produce, highlighting gaps, missing edge cases, potential improvements, or deviations from best practices. The goal is to identify specific areas where the implementation falls short of an ideal solution.
+
+          Process:
+          1. Read the task and the implementor's output.
+          2. Consider what a "perfect" implementation from an advanced coding agent would look like: handling edge cases, error handling, logging, performance, security, etc.
+          3. Identify concrete gaps between the implementor's code and that ideal.
+          4. Prioritize the gaps: what must be fixed before the task can be considered done.
+
+          Output format:
+          ## Gap Analysis
+          | Gap ID | Description | Severity | How to Fix |
+          |--------|-------------|----------|-------------|
+
+          ## Recommended Actions
+          - [List prioritized fix suggestions]
+
+      - name: "Moderator"
+        prompt: |
+          You are a Moderator who makes the final call on whether the task is done. Consider the original task, the implementor's latest code, and the reviewer's gap analysis. If the remaining gaps are trivial or non-critical, you will declare the task done by including the exact phrase "<!-- flow:done -->" at the end of your response. Otherwise, you must provide clear instructions on what the implementor should address next, so the cycle repeats.
+
+          Process:
+          1. Review the complete history: task, implementor's output, reviewer's gap analysis.
+          2. Assess the severity of any remaining gaps. Can they be safely deferred? Or are they blocking?
+          3. Decide: DONE or CONTINUE.
+          4. If DONE, include the sentinel "<!-- flow:done -->" in your output. If CONTINUE, outline the most critical gaps that still need work.
+
+          Output format:
+          ## Decision: DONE or CONTINUE
+
+          ### Reasoning
+          [Explain why the task is complete or what remains]
+
+          [If CONTINUE:]
+          ### Next Steps for Implementor
+          - [Specific instructions based on gap analysis]
+
+          [If DONE:]
+          ### Summary of Completed Task
+          - [What was accomplished]
+
+          Make sure to include the sentinel "<!-- flow:done -->" at the very end of your response if the task is done.
+
+  - name: "Apply Changes"
+    iterations: 1
+    roles:
+      - name: "Code Applier"
+        prompt: |
+          You are a Code Applier who takes the final implementation from the Gap Analysis Cycle and applies it to the codebase. Your job is to modify files exactly as specified, ensuring correctness and consistency.
+
+          Process:
+          1. Review the final implementation code produced in the previous stage (look for the last Implementor output).
+          2. Locate the relevant files in the workspace using `copilot_findTextInFiles` or by reading file contents with `copilot_readFile`.
+          3. Apply the changes using `copilot_replaceString` to modify existing files, or `copilot_createFile` when creating new files.
+          4. After applying, read the modified files to verify correctness.
+
+          Output format:
+          ## Applied Changes
+          List the files modified and the changes made.
+
+          ## Summary
+          Briefly confirm that the implementation has been successfully applied.
+
+sharedContext: |
+  # Iterative Gap Analysis
+
+  ## What This Does
+  This flow refines a task implementation through up to 10 iterative cycles of implementation, review, and moderation. Once the gap analysis cycle declares the task done, a dedicated Code Applier applies the final code to the actual workspace files.
+
+  ## When to Use
+  - When you want to iteratively close the gap between a basic implementation and an expert-level solution
+  - For tasks where edge cases, robustness, and best practices are critical
+  - When you want an automated code review and refinement loop that finally materializes as file changes
+
+  ## How It Works
+  1. **Gap Analysis Cycle** (iterative, max 10 loops):
+     - **Implementor** writes/updates code based on the task and previous feedback.
+     - **Reviewer** compares the code against an ideal agent output, identifying gaps.
+     - **Moderator** decides if the task is done. If yes, the cycle exits; otherwise, it provides direction for the next iteration.
+  2. **Apply Changes** (single pass):
+     - **Code Applier** reads the final implementation from the cycle and applies it to the workspace using file-modifying tools.
+
+  ## Example
+  ```

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { AppServerThread } from './appServer/thread';
+import { AppServerConnection } from './appServer/connection';
 import { resolveBinary } from './appServer/client';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -33,32 +33,34 @@ export const CODEX_FAMILY = 'codex';
  */
 export class CodexModelProvider implements vscode.LanguageModelChatProvider {
 	private _cachedModels: vscode.LanguageModelChatInformation[] | null = null;
+	private _refreshPromise: Promise<void> | null = null;
 	private readonly _onDidChange = new vscode.EventEmitter<void>();
 	readonly onDidChangeLanguageModelChatInformation = this._onDidChange.event;
 
-	async provideLanguageModelChatInformation(
-		_options: unknown,
-		_token: vscode.CancellationToken
-	): Promise<vscode.LanguageModelChatInformation[]> {
-		console.log('[codex-provider] provideLanguageModelChatInformation called', { cached: this._cachedModels !== null });
-
-		if (this._cachedModels !== null) {
-			console.log('[codex-provider] returning cached models (' + this._cachedModels.length + ')', this._cachedModels.map(m => m.id));
-			return this._cachedModels;
+	/**
+	 * Kick off an eager background fetch so the model list is ready before
+	 * the chat picker needs it. Returns immediately; callers that need to
+	 * wait for results should await the returned promise.
+	 */
+	prefetch(): Promise<void> {
+		if (this._refreshPromise) {
+			return this._refreshPromise;
 		}
+		// Resolve binary path eagerly (settings may not be ready on activate)
+		this._refreshPromise = this._doRefresh();
+		return this._refreshPromise;
+	}
 
+	private async _doRefresh(): Promise<void> {
 		try {
 			const rawBinaryPath = vscode.workspace.getConfiguration('codex').get<string>('binaryPath') ?? '';
 			const binaryPath = resolveBinary(rawBinaryPath);
 			console.log('[codex-provider] binary path', { raw: rawBinaryPath, resolved: binaryPath });
 
-			// Use a temporary thread to list models: connect → list → disconnect
-			console.log('[codex-provider] connecting to app server...');
-			const thread = new AppServerThread({ binaryPath });
-			await thread.connect();
-			console.log('[codex-provider] connected, listing models...');
-			const models = await thread.listModels();
-			thread.disconnect();
+			const conn = new AppServerConnection({ binaryPath });
+			await conn.connect();
+			const models = await conn.listModels();
+			conn.disconnect();
 			console.log('[codex-provider] raw models from app server', JSON.stringify(models));
 
 			this._cachedModels = models.map(m => ({
@@ -69,16 +71,36 @@ export class CodexModelProvider implements vscode.LanguageModelChatProvider {
 				maxInputTokens: 200000,
 				maxOutputTokens: 65536,
 				capabilities: { toolCalling: true, imageInput: false },
-				// proposed API — makes models visible in picker immediately
 				isUserSelectable: true,
 			}));
-			console.log('[codex-provider] returning', this._cachedModels.length, 'models:', this._cachedModels.map(m => m.id));
+			console.log('[codex-provider] loaded', this._cachedModels.length, 'models');
+			this._onDidChange.fire();
 		} catch (err) {
-			console.error('[codex-provider] failed to list models — will retry on next call. Error:', String(err));
-			// Do NOT cache the empty result — leave _cachedModels as null so VS Code can retry
+			console.error('[codex-provider] failed to list models: ' + String(err));
+			// Clear promise so next call can retry
+			this._refreshPromise = null;
 		}
+	}
 
-		return this._cachedModels ?? [];
+	async provideLanguageModelChatInformation(
+		_options: unknown,
+		_token: vscode.CancellationToken
+	): Promise<vscode.LanguageModelChatInformation[]> {
+		// NEVER spawn a subprocess synchronously — this method is called
+		// by vscode.lm.selectChatModels which may be invoked from proxy
+		// HTTP handlers on the microtask queue. Blocking here deadlocks.
+		//
+		// Instead, eagerly prefetch at activation time and always return
+		// from cache. If the prefetch hasn't completed yet, kick one off
+		// and return empty — the picker will receive models on the next
+		// _onDidChange fire.
+		if (this._cachedModels !== null) {
+			return this._cachedModels;
+		}
+		if (!this._refreshPromise) {
+			this._refreshPromise = this._doRefresh();
+		}
+		return [];
 	}
 
 	provideTokenCount(
@@ -107,6 +129,7 @@ export class CodexModelProvider implements vscode.LanguageModelChatProvider {
 	 */
 	invalidateCache(): void {
 		this._cachedModels = null;
+		this._refreshPromise = null;
 		this._onDidChange.fire();
 	}
 }
@@ -121,13 +144,9 @@ export function registerCodexModels(context: vscode.ExtensionContext): CodexMode
 	const disposable = vscode.lm.registerLanguageModelChatProvider(CODEX_PROVIDER_ID, provider);
 	console.log('[codex-provider] registered successfully');
 	context.subscriptions.push(disposable);
-	// Invalidate cache when the binary path setting changes
-	context.subscriptions.push(
-		vscode.workspace.onDidChangeConfiguration(e => {
-			if (e.affectsConfiguration('codex.binaryPath')) {
-				provider.invalidateCache();
-			}
-		})
-	);
+	// Eagerly prefetch model list so it is available before the chat picker
+	// or proxy model-lookup needs it; avoids subprocess spawn during a
+	// synchronous provideLanguageModelChatInformation call.
+	provider.prefetch();
 	return provider;
 }
