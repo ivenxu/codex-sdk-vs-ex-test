@@ -217,6 +217,22 @@ export interface TurnStartResponse {
 	turn: Turn;
 }
 
+// ─── Turn cancellation & steering ─────────────────────────────────────────────
+// Mirrors agent-host: codexAgent._startConnection wires `turn/interrupt`
+// (abortSession) and `turn/steer` (setPendingMessages).
+
+export interface TurnInterruptParams {
+	threadId: string;
+	turnId: string;
+}
+
+export interface TurnSteerParams {
+	threadId: string;
+	input: Array<UserInput>;
+	expectedTurnId: string;
+	clientUserMessageId?: string | null;
+}
+
 // ─── Notifications ────────────────────────────────────────────────────────────
 
 export interface ItemStartedNotification {
@@ -339,4 +355,91 @@ export interface FileChangeRequestApprovalParams {
 export interface ServerRequestResolvedNotification {
 	threadId: string;
 	requestId: string | number;
+}
+
+// ─── MCP Server Protocol ─────────────────────────────────────────────────────
+
+export type McpServerState = 'ready' | 'starting' | 'cancelled' | 'error' | 'running';
+
+export interface McpServerStatus {
+	serverName: string;
+	status: McpServerState;
+	error?: string;
+	tools?: Array<DynamicToolSpec>;
+}
+
+export interface McpServerStatusListParams {
+	cursor?: string;
+	limit?: number;
+}
+
+export interface McpServerStatusListResponse {
+	data: Array<McpServerStatus>;
+	nextCursor?: string;
+}
+
+export interface McpServerStatusUpdatedNotification {
+	serverName: string;
+	status: McpServerState;
+	error?: string;
+}
+
+// ─── MCP Server Tool Call (Request/Response cycle) ───────────────────────────
+
+export interface McpServerToolCallParams {
+	threadId: string;
+	serverName: string;
+	toolName: string;
+	arguments: Record<string, unknown>;
+}
+
+export interface McpServerToolCallResponse {
+	content: Array<{ type: 'text'; text: string }>;
+	isError?: boolean;
+}
+
+// ─── MCP Tool Approval via requestUserInput ──────────────────────────────────
+
+export interface ToolRequestUserInputParams {
+	threadId: string;
+	itemId: string;
+	questions: Array<ToolRequestUserInputQuestion>;
+}
+
+export interface ToolRequestUserInputQuestion {
+	id: string;
+	label: string;
+	description?: string;
+	defaultValue?: string;
+	required?: boolean;
+}
+
+export interface ToolRequestUserInputAnswer {
+	questionId: string;
+	value: string;
+}
+
+export interface ToolRequestUserInputResponse {
+	answers: Array<ToolRequestUserInputAnswer>;
+}
+
+// ─── MCP Elicitation ─────────────────────────────────────────────────────────
+
+export interface McpServerElicitationRequestParams {
+	threadId: string;
+	serverName: string;
+	message: string;
+}
+
+export interface McpServerElicitationRequestResponse {
+	decision: 'accept' | 'decline' | 'cancel';
+}
+
+// ─── MCP Inventory Entry ─────────────────────────────────────────────────────
+
+export interface McpInventoryEntry {
+	name: string;
+	status: McpServerState;
+	tools?: Array<DynamicToolSpec>;
+	error?: string;
 }

@@ -10,7 +10,11 @@ import type {
 	ThreadStartParams, ThreadStartResponse,
 	ThreadResumeParams, ThreadResumeResponse,
 	TurnStartParams, TurnStartResponse,
+	TurnInterruptParams, TurnSteerParams,
 	DynamicToolSpec, DynamicToolCallParams, DynamicToolCallResponse,
+	McpServerToolCallParams, McpServerToolCallResponse,
+	McpServerStatusListParams, McpServerStatusListResponse,
+	McpServerStatusUpdatedNotification,
 } from '../protocol/types';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -21,6 +25,8 @@ export interface ConnectionOptions {
 	proxyBaseUrl?: string;
 	proxyApiKey?: string;
 	proxyWireApi?: 'responses' | 'messages';
+	/** Additional CLI args passed to the codex binary (e.g. MCP server config). */
+	extraArgs?: string[];
 }
 
 /** Extra connection-level fields exposed to the participant */
@@ -45,6 +51,8 @@ export class AppServerConnection extends EventEmitter {
 	private readonly _options: ConnectionOptions;
 	/** Per-thread private EventEmitters */
 	private readonly _threads = new Map<string, EventEmitter>();
+	/** Connection-level MCP notification handlers */
+	private readonly _mcpHandlers = new Map<string, (...args: unknown[]) => void>();
 	private _connected = false;
 
 	constructor(options: ConnectionOptions) {
@@ -54,7 +62,7 @@ export class AppServerConnection extends EventEmitter {
 
 		// Build -c overrides and env for proxy mode
 		let clientEnv: NodeJS.ProcessEnv | undefined;
-		let extraArgs: string[] | undefined;
+		let extraArgs: string[] = options.extraArgs ? [...options.extraArgs] : [];
 		if (options.proxyBaseUrl) {
 			const wireApi = options.proxyWireApi ?? 'responses';
 			const envKey = wireApi === 'messages' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
@@ -69,14 +77,14 @@ export class AppServerConnection extends EventEmitter {
 				`model_providers.vscode-proxy.supports_websockets=false`,
 				`features.tool_call_mcp_elicitation=false`,
 			];
-			extraArgs = overrides.flatMap(kv => ['-c', kv]);
+			extraArgs = [...overrides.flatMap(kv => ['-c', kv]), ...extraArgs];
 		}
 
 		this._client = new AppServerClient({
 			binaryPath: options.binaryPath,
 			cwd: options.cwd,
 			env: clientEnv,
-			extraArgs,
+			extraArgs: extraArgs.length > 0 ? extraArgs : undefined,
 		});
 
 		// ── THE KEY: Per-thread notification dispatch ──
@@ -88,6 +96,12 @@ export class AppServerConnection extends EventEmitter {
 			// Log item/started and item/completed for fileChange diagnostics
 			if (n.method === 'item/started' || n.method === 'item/completed') {
 				console.log(`[app-server] notif: ${n.method} type=${n.params?.item?.type}`, JSON.stringify(n.params).slice(0, 200));
+			}
+
+			// ── MCP connection-level notifications (MCP-02) ──
+			if (n.method && this._mcpHandlers.has(n.method)) {
+				const handler = this._mcpHandlers.get(n.method)!;
+				handler(n.params);
 			}
 
 			if (threadId) {
@@ -103,11 +117,19 @@ export class AppServerConnection extends EventEmitter {
 			this.emit('notification', notification);
 		});
 
-		// ── Server-initiated request dispatch (approvals, tool calls) ──
+		// ── Server-initiated request dispatch (approvals, tool calls, MCP) ──
 		// These also carry threadId in params
 		this._client.on('request', (request: unknown) => {
 			const r = request as { method?: string; id: string | number; params?: { threadId?: string } };
 			const threadId = r.params?.threadId;
+
+			// ── MCP connection-level requests ──
+			if (r.method && this._mcpHandlers.has(r.method)) {
+				const handler = this._mcpHandlers.get(r.method)!;
+				handler(r.params);
+				return;
+			}
+
 			if (threadId) {
 				const session = this._threads.get(threadId);
 				if (session) {
@@ -124,6 +146,7 @@ export class AppServerConnection extends EventEmitter {
 		this._client.on('exit', (info: unknown) => {
 			this._connected = false;
 			this._threads.clear();
+			this._mcpHandlers.clear();
 			this.emit('exit', info);
 		});
 	}
@@ -141,6 +164,17 @@ export class AppServerConnection extends EventEmitter {
 	}
 
 	isConnected(): boolean { return this._connected; }
+
+	// ─── MCP Notification Registration (MCP-02) ───────────────────────────────
+
+	/**
+	 * Register a handler for an MCP-related notification at the connection level.
+	 * These fire regardless of threadId, since MCP server lifecycle events are
+	 * not scoped to a single thread.
+	 */
+	onMcpNotification(method: string, handler: (...args: unknown[]) => void): void {
+		this._mcpHandlers.set(method, handler);
+	}
 
 	// ─── Per-Thread Subscription ──────────────────────────────────────────────
 
@@ -194,11 +228,55 @@ export class AppServerConnection extends EventEmitter {
 		return result.turn;
 	}
 
+	/**
+	 * Interrupt an in-flight turn. Mirrors agent-host `abortSession` /
+	 * `codexAgent._abortSession` → `turn/interrupt`.
+	 * After interruption codex emits `turn/completed` with status
+	 * `interrupted`; the thread stays loaded and can accept new turns.
+	 */
+	async interruptTurn(params: TurnInterruptParams): Promise<void> {
+		console.log('[app-server] interruptTurn', { threadId: params.threadId, turnId: params.turnId });
+		await this._client.request('turn/interrupt', params);
+	}
+
+	/**
+	 * Inject user input into a running turn. Mirrors agent-host
+	 * `setPendingMessages` → `turn/steer`.
+	 * Codex echoes the steered input as a `userMessage` item; the caller
+	 * can promote it into a visible turn by intercepting `item/started`.
+	 */
+	async steerTurn(params: TurnSteerParams): Promise<void> {
+		console.log('[app-server] steerTurn', { threadId: params.threadId, expectedTurnId: params.expectedTurnId, inputLen: params.input.length });
+		await this._client.request('turn/steer', params);
+	}
+
 	// ─── Model Discovery ──────────────────────────────────────────────────────
 
 	async listModels(includeHidden = false): Promise<Array<{ id: string; displayName?: string; label?: string; hidden?: boolean }>> {
 		const result = await this._client.request('model/list', { includeHidden }) as { data?: Array<{ id: string; displayName?: string; label?: string; hidden?: boolean }> };
 		return result.data ?? [];
+	}
+
+	// ─── MCP Server Status (MCP-02) ───────────────────────────────────────────
+
+	/**
+	 * Poll `mcpServerStatus/list` with cursor pagination.
+	 * Used by _refreshMcpInventory to discover MCP servers and their tools.
+	 */
+	async listMcpServerStatuses(params: McpServerStatusListParams): Promise<McpServerStatusListResponse> {
+		const result = await this._client.request('mcpServerStatus/list', params) as McpServerStatusListResponse;
+		return result;
+	}
+
+	// ─── MCP Tool Call (MCP-03) ───────────────────────────────────────────────
+
+	/**
+	 * Forward an MCP tool call to the codex app-server which manages
+	 * MCP connections internally. Returns the tool execution result.
+	 */
+	async mcpToolCall(params: McpServerToolCallParams): Promise<McpServerToolCallResponse> {
+		const result = await this._client.request('mcpServer/tool/call', params) as McpServerToolCallResponse;
+		return result;
 	}
 
 	// ─── Approval ─────────────────────────────────────────────────────────────
@@ -212,11 +290,17 @@ export class AppServerConnection extends EventEmitter {
 		this._client.respond(requestId, response);
 	}
 
+	/** Respond to any server-initiated request with a generic payload. */
+	respondToGeneric(requestId: string | number, response: unknown): void {
+		this._client.respond(requestId, response);
+	}
+
 	// ─── Teardown ─────────────────────────────────────────────────────────────
 
 	disconnect(): void {
 		this._client.stop();
 		this._threads.clear();
+		this._mcpHandlers.clear();
 		this._connected = false;
 	}
 }

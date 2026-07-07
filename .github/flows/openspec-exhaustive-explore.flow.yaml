@@ -1,0 +1,63 @@
+name: "OpenSpec Exhaustive Explore"
+description: "Multi-turn iterative exploration using OpenSpec's explore skill to achieve exhaustive understanding."
+category: "software-development"
+subcategory: "specifications"
+difficulty: "intermediate"
+tags:
+  - openspec
+  - explore
+  - exhaustive
+  - iterative
+version: "1.0.0"
+author: "generated"
+
+
+tools:
+  - read_file
+  - grep_search
+  - file_search
+  - list_dir
+  - run_in_terminal
+  - github_text_search
+  - fetch_webpage
+
+
+stages:
+  - name: "Exhaustive Exploration"
+    iterations: 5
+    doneWord: "<!-- flow:done -->"
+    roles:
+      - name: "Explorer"
+        skills:
+          - "openspec-explore"
+        prompt: |
+          You are an exhaustive exploration specialist. Your goal is to thoroughly investigate the topic using the OpenSpec explore skill.
+
+          Process:
+          1. Use the openspec-explore skill to query and analyze the target specification or codebase.
+          2. Review the generated exploration output.
+          3. Identify gaps, unanswered questions, or areas needing deeper analysis.
+          4. If further exploration is beneficial, refine the query and explore again; the stage will automatically loop.
+          5. When confident that the exploration is fully exhaustive (no remaining meaningful questions), output `<!-- flow:done -->` on its own line to end the stage early.
+
+          Be methodical: start broad, then drill into specifics. Each iteration builds on prior results. Aim for zero blind spots.
+
+sharedContext: |
+  # OpenSpec Exhaustive Explore
+
+  ## What This Does
+  Iteratively calls the OpenSpec explore skill to deeply investigate a specification, codebase, or documentation set. It loops up to 5 times (or until convergence) to ensure all aspects are covered.
+
+  ## When to Use
+  - You want a complete, exhaustive understanding of an OpenSpec-managed specification
+  - You need to surface hidden dependencies, edge cases, or undocumented assumptions
+  - You are performing an audit or impact analysis and cannot afford oversights
+
+  ## How It Works
+  1. You provide a target (e.g., a component name or spec path)
+  2. The Explorer uses the openspec-explore skill to produce an initial analysis
+  3. The flow evaluates the results and, if gaps remain, automatically refines the exploration
+  4. This repeats until no more insights can be gained (or the maximum 5 iterations are reached)
+
+  ## Example
+  ```

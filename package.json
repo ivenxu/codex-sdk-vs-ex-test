@@ -70,6 +70,35 @@
 					"type": "string",
 					"default": "",
 					"description": "Absolute path to the Claude Code binary. Leave empty to auto-discover via PATH."
+				},
+				"codex.mcpServers": {
+					"type": "object",
+					"default": {},
+					"description": "MCP server configuration passed to Codex.",
+					"additionalProperties": {
+						"type": "object",
+						"properties": {
+							"command": {
+								"type": "string"
+							},
+							"args": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								}
+							},
+							"env": {
+								"type": "object",
+								"additionalProperties": {
+									"type": "string"
+								}
+							},
+							"url": {
+								"type": "string"
+							}
+						},
+						"additionalProperties": true
+					}
 				}
 			}
 		}

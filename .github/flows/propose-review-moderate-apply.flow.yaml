@@ -1,36 +1,34 @@
-name: "Iterative Gap Analysis"
-description: "Refine task implementation through iterative cycles of implementation, review, and moderation, then apply the final code to the workspace."
+name: "Propose-Review-Moderate-Apply"
+description: "Refine a proposal through iterative cycles of proposal, review, and moderation, then apply the final result to the workspace."
 category: "software-development"
 difficulty: "advanced"
-tags: ["iterative", "gap-analysis", "code-review", "task-refinement", "code-application"]
-version: "1.1.0"
+tags: ["iterative", "propose-review", "moderation", "code-review", "task-refinement", "code-application"]
+version: "1.0.0"
 author: "generated"
 tools:
   - copilot_readFile
   - copilot_findTextInFiles
   - copilot_createFile
   - copilot_replaceString
-contexts:
-  - "GAP_ANALYSIS.md"
-  - "VSCODE_CODEX_ARCHITECTURE_DEEP_DIVE.md"
+contexts: []
 stages:
-  - name: "Gap Analysis Cycle"
+  - name: "Propose-Review-Moderate Cycle"
     iterations: 10
     doneWord: "<!-- flow:done -->"
     roles:
-      - name: "Implementor"
+      - name: "Proposer"
         prompt: |
-          You are an Implementor who writes code based on the given task. Your goal is to produce a correct and complete implementation, considering any previous feedback from the Reviewer and Moderator.
+          You are a Proposer who creates a proposal based on the given task. Your goal is to produce a well-thought-out and complete proposal, considering any previous feedback from the Reviewer and Moderator.
 
           Process:
-          1. Read the task description and any previous implementation attempts.
-          2. Review the Reviewer's gap analysis and Moderator's decision from the last iteration (if any).
-          3. Implement or modify the code to address the gaps and meet the task requirements.
-          4. Provide the complete implementation or updated code.
+          1. Read the task description and any previous proposals.
+          2. Review the Reviewer's analysis and Moderator's decision from the last iteration (if any).
+          3. Create or refine the proposal to address the gaps and meet the task requirements.
+          4. Provide the complete proposal or updated version.
 
           Output format:
-          ## Implementation
-          Provide the code or changes. Use markdown code blocks with language identifier.
+          ## Proposal
+          Provide the proposal or changes. Use markdown formatting with clear sections.
 
           ## Changes made
           List the changes you made, referencing the gap analysis.
@@ -100,23 +98,23 @@ stages:
           Briefly confirm that the implementation has been successfully applied.
 
 sharedContext: |
-  # Iterative Gap Analysis
+  # Propose-Review-Moderate-Apply
 
   ## What This Does
-  This flow refines a task implementation through up to 10 iterative cycles of implementation, review, and moderation. Once the gap analysis cycle declares the task done, a dedicated Code Applier applies the final code to the actual workspace files.
+  This flow refines a proposal through up to 10 iterative cycles of proposal, review, and moderation. Once the cycle declares the task done, a dedicated Applier applies the final result to the actual workspace files.
 
   ## When to Use
-  - When you want to iteratively close the gap between a basic implementation and an expert-level solution
-  - For tasks where edge cases, robustness, and best practices are critical
-  - When you want an automated code review and refinement loop that finally materializes as file changes
+  - When you want to iteratively refine a proposal through expert review
+  - For tasks where quality, completeness, and best practices are critical
+  - When you want an automated review and refinement loop that finally materializes as concrete changes
 
   ## How It Works
-  1. **Gap Analysis Cycle** (iterative, max 10 loops):
-     - **Implementor** writes/updates code based on the task and previous feedback.
-     - **Reviewer** compares the code against an ideal agent output, identifying gaps.
-     - **Moderator** decides if the task is done. If yes, the cycle exits; otherwise, it provides direction for the next iteration.
+  1. **Propose-Review-Moderate Cycle** (iterative, max 10 loops):
+     - **Proposer** creates/refines a proposal based on the task and previous feedback.
+     - **Reviewer** evaluates the proposal against an ideal solution, identifying gaps and improvements.
+     - **Moderator** decides if the proposal is ready. If yes, the cycle exits; otherwise, provides direction for the next iteration.
   2. **Apply Changes** (single pass):
-     - **Code Applier** reads the final implementation from the cycle and applies it to the workspace using file-modifying tools.
+     - **Applier** reads the final proposal from the cycle and applies it to the workspace using file-modifying tools.
 
   ## Example
   ```

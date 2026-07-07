@@ -29,6 +29,19 @@ import type {
 	CommandExecutionRequestApprovalParams,
 	FileChangeRequestApprovalParams,
 	FileUpdateChange,
+	McpServerStatusUpdatedNotification,
+	McpServerToolCallParams,
+	McpServerToolCallResponse,
+	ToolRequestUserInputParams,
+	ToolRequestUserInputAnswer,
+	ToolRequestUserInputResponse,
+	McpServerElicitationRequestParams,
+	McpServerElicitationRequestResponse,
+	McpInventoryEntry,
+	McpServerStatusListParams,
+	McpServerStatusListResponse,
+	McpServerState,
+	UserInput,
 } from './protocol/types';
 
 // ─── Logger ───────────────────────────────────────────────────────────────────
@@ -49,6 +62,9 @@ interface TurnMetadata {
 
 type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
 
+/**
+ * Per-session state. Mirrors agent-host's ICodexSession in codexAgent.ts.
+ */
 interface SessionState {
 	/** The active codex Thread for this session. */
 	thread: Thread;
@@ -64,6 +80,8 @@ interface SessionState {
 	pendingFileChangeApprovals: PendingRequestRegistry<ApprovalDecision>;
 	/** Parked dynamic tool call requests. */
 	pendingToolCalls: PendingRequestRegistry<DynamicToolCallResponse>;
+	/** Parked MCP tool approval requests. */
+	pendingMcpApprovals: PendingRequestRegistry<ApprovalDecision>;
 	/** Whether a turn is currently active (item stream is being processed). */
 	turnActive: boolean;
 	/** Resolve when the turn completes (success or failure). */
@@ -74,6 +92,68 @@ interface SessionState {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+interface ChatTurnWithMetadata {
+	result?: {
+		metadata?: Partial<TurnMetadata>;
+	};
+}
+
+function findMetaInHistory(history: readonly (vscode.ChatRequestTurn | vscode.ChatResponseTurn)[]): TurnMetadata | null {
+	for (let i = history.length - 1; i >= 0; i--) {
+		const turn = history[i];
+		if (turn instanceof vscode.ChatRequestTurn) {
+			const meta = (turn as unknown as ChatTurnWithMetadata).result?.metadata;
+			if (meta?.threadId) {
+				return { threadId: meta.threadId };
+			}
+		}
+	}
+	return null;
+}
+
+function hashTools(tools: DynamicToolSpec[]): string {
+	const names = tools.map(t => t.name).sort().join(',');
+	let hash = 0;
+	for (let i = 0; i < names.length; i++) {
+		hash = ((hash << 5) - hash) + names.charCodeAt(i);
+		hash |= 0;
+	}
+	return String(Math.abs(hash));
+}
+
+/** Build MCP server CLI args from VS Code configuration.
+ *  Follows agent-host pattern: -c mcp_servers.<name>.<field>=<value>
+ */
+function buildMcpConfigArgs(): string[] {
+	const mcpServers = vscode.workspace.getConfiguration('codex').get<Record<string, unknown>>('mcpServers');
+	if (!mcpServers || typeof mcpServers !== 'object') {
+		return [];
+	}
+	const args: string[] = [];
+	for (const [name, config] of Object.entries(mcpServers)) {
+		if (!config || typeof config !== 'object') { continue; }
+		const cfg = config as Record<string, unknown>;
+		if (typeof cfg.command === 'string') {
+			args.push('-c', `mcp_servers.${name}.command=${cfg.command}`);
+		}
+		if (Array.isArray(cfg.args) && cfg.args.length > 0) {
+			args.push('-c', `mcp_servers.${name}.args=${JSON.stringify(cfg.args)}`);
+		}
+		if (cfg.env && typeof cfg.env === 'object') {
+			for (const [k, v] of Object.entries(cfg.env as Record<string, unknown>)) {
+				args.push('-c', `mcp_servers.${name}.env.${k}=${String(v)}`);
+			}
+		}
+		if (typeof cfg.url === 'string') {
+			args.push('-c', `mcp_servers.${name}.url=${cfg.url}`);
+		}
+	}
+	return args;
+}
+
+/** Duration-guard timeout for forced cleanup after turn/interrupt. */
+const INTERRUPT_TIMEOUT_MS = 5_000;
+
 // ─── Participant ────────────────────────────────────────────────────────────────
 
 export class CodexParticipant {
@@ -81,13 +161,13 @@ export class CodexParticipant {
 	private proxyConn: AppServerConnection | null = null;
 	/** Per-session state keyed by threadId. */
 	private readonly _sessions = new Map<string, SessionState>();
+	/** MCP server inventory — mirrors agent-host's _mcpInventory. */
+	private _mcpInventory: Map<string, McpInventoryEntry> = new Map();
 
 	constructor(
 		private readonly proxyManager: ProxyManager,
 		private readonly _toolManager: DynamicToolManager,
 	) {
-		// Reject all pending registries when the connection drops.
-		// This prevents dangling promises from blocking codex.
 		this._onConnectionExit = this._onConnectionExit.bind(this);
 	}
 
@@ -96,8 +176,10 @@ export class CodexParticipant {
 			session.pendingCommandApprovals.denyAll('cancel');
 			session.pendingFileChangeApprovals.denyAll('cancel');
 			session.pendingToolCalls.rejectAll(new Error('Codex app-server disconnected'));
+			session.pendingMcpApprovals.denyAll('cancel');
 			if (session.turnActive) {
 				session.turnActive = false;
+				session.currentAppTurnId = undefined;
 				session.turnReject(new Error('Codex app-server disconnected; session must restart.'));
 			}
 		}
@@ -106,17 +188,127 @@ export class CodexParticipant {
 	private _ensureConnection(routing: 'native' | 'proxy', binaryPath: string, cwd?: string): AppServerConnection {
 		if (routing === 'native') {
 			if (!this.nativeConn) {
-				this.nativeConn = new AppServerConnection({ binaryPath, cwd });
+				const mcpArgs = buildMcpConfigArgs();
+				this.nativeConn = new AppServerConnection({ binaryPath, cwd, extraArgs: mcpArgs });
 				this.nativeConn.on('exit', this._onConnectionExit);
+				this._setupMcpHandlers(this.nativeConn);
 			}
 			return this.nativeConn;
 		}
 		if (!this.proxyConn) {
 			const info = this.proxyManager.info;
-			this.proxyConn = new AppServerConnection({ binaryPath, cwd, proxyBaseUrl: info.responsesUrl, proxyApiKey: info.responsesNonce });
+			const mcpArgs = buildMcpConfigArgs();
+			this.proxyConn = new AppServerConnection({ binaryPath, cwd, proxyBaseUrl: info.responsesUrl, proxyApiKey: info.responsesNonce, extraArgs: mcpArgs });
 			this.proxyConn.on('exit', this._onConnectionExit);
+			this._setupMcpHandlers(this.proxyConn);
 		}
 		return this.proxyConn;
+	}
+
+	// ── MCP Inventory Management (MCP-02) ──────────────────────────────────
+
+	/**
+	 * Register MCP notification handlers on a connection.
+	 * Must be called once per connection before the connection is used.
+	 */
+	private _setupMcpHandlers(conn: AppServerConnection): void {
+		// Handle MCP server startup status updates
+		conn.onMcpNotification('mcpServer/startupStatus/updated', (...args) => {
+			const params = args[0] as McpServerStatusUpdatedNotification;
+			const existing = this._mcpInventory.get(params.serverName);
+			const entry: McpInventoryEntry = {
+				name: params.serverName,
+				status: params.status,
+				error: params.error,
+				tools: existing?.tools,
+			};
+			this._mcpInventory.set(params.serverName, entry);
+			log('mcp server status', { server: params.serverName, status: params.status, error: params.error });
+
+			if (params.status === 'ready') {
+				// Refresh inventory to get tools when a server becomes ready
+				void this._refreshMcpInventory(conn);
+			}
+		});
+	}
+
+	/**
+	 * Poll `mcpServerStatus/list` with cursor pagination to refresh the
+	 * full MCP inventory. Mirrors agent-host codexAgent.ts pattern.
+	 */
+	private async _refreshMcpInventory(conn: AppServerConnection): Promise<void> {
+		try {
+			let cursor: string | undefined;
+			do {
+				const params: McpServerStatusListParams = { limit: 50 };
+				if (cursor) { params.cursor = cursor; }
+				const result = await conn.listMcpServerStatuses(params);
+				for (const server of result.data) {
+					const existing = this._mcpInventory.get(server.serverName);
+					const entry: McpInventoryEntry = {
+						name: server.serverName,
+						status: server.status,
+						tools: server.tools ?? existing?.tools,
+						error: server.error,
+					};
+					this._mcpInventory.set(server.serverName, entry);
+					log('mcp inventory', { server: server.serverName, status: server.status, tools: server.tools?.length ?? 0 });
+				}
+				cursor = result.nextCursor;
+			} while (cursor);
+		} catch (err) {
+			logErr('_refreshMcpInventory failed', err);
+		}
+	}
+
+	/**
+	 * Poll MCP inventory after connection is established.
+	 * Called from handleRequest after connect().
+	 */
+	private async _initMcpInventory(conn: AppServerConnection): Promise<void> {
+		try {
+			await this._refreshMcpInventory(conn);
+		} catch (err) {
+			logErr('_initMcpInventory failed', err);
+		}
+	}
+
+	/**
+	 * Send `turn/interrupt` to the codex app-server and wait for the
+	 * `turn/completed` notification (or a timeout) before cleaning up.
+	 * Mirrors agent-host `codexAgent.abortSession`.
+	 */
+	private async _interruptTurn(
+		conn: AppServerConnection,
+		session: SessionState,
+	): Promise<void> {
+		const appTurnId = session.currentAppTurnId;
+		const threadId = session.thread.id;
+		if (!session.turnActive || !appTurnId) {
+			return;
+		}
+		log('interrupting turn', { threadId, turnId: appTurnId });
+		try {
+			await conn.interruptTurn({ threadId, turnId: appTurnId });
+			// Await the `turn/completed` notification that codex fires after
+			// interruption, but cap with a timeout so we never hang.
+			await Promise.race([
+				session.turnDone,
+				new Promise<void>(resolve => setTimeout(resolve, INTERRUPT_TIMEOUT_MS)),
+			]);
+		} catch (err) {
+			logErr('turn/interrupt failed', err);
+		}
+		// Force-cleanup in case the notification never arrived.
+		if (session.turnActive) {
+			session.turnActive = false;
+			session.currentAppTurnId = undefined;
+			session.pendingCommandApprovals.denyAll('cancel');
+			session.pendingFileChangeApprovals.denyAll('cancel');
+			session.pendingMcpApprovals.denyAll('cancel');
+			session.pendingToolCalls.rejectAll(new Error('Request cancelled'));
+			session.turnResolve();
+		}
 	}
 
 	async handleRequest(
@@ -139,6 +331,8 @@ export class CodexParticipant {
 		if (!conn.isConnected()) {
 			stream.progress('Connecting to Codex...');
 			await conn.connect();
+			// Initialize MCP inventory after connection (MCP-02)
+			await this._initMcpInventory(conn);
 		}
 
 		const savedMeta = findMetaInHistory(context.history);
@@ -197,6 +391,7 @@ export class CodexParticipant {
 				pendingCommandApprovals: new PendingRequestRegistry(),
 				pendingFileChangeApprovals: new PendingRequestRegistry(),
 				pendingToolCalls: new PendingRequestRegistry(),
+				pendingMcpApprovals: new PendingRequestRegistry(),
 				turnActive: false,
 				turnDone,
 				turnResolve,
@@ -218,14 +413,29 @@ export class CodexParticipant {
 		ts.on('turn/completed', (p: TurnCompletedNotification) => {
 			session!.turnActive = false;
 			session!.currentAppTurnId = undefined;
-			// Unpark any approvals that were never resolved so codex doesn't block.
-			session!.pendingCommandApprovals.denyAll('cancel');
-			session!.pendingFileChangeApprovals.denyAll('cancel');
 			if (p.turn.status === 'failed') {
+				session!.pendingCommandApprovals.denyAll('cancel');
+				session!.pendingFileChangeApprovals.denyAll('cancel');
+				session!.pendingMcpApprovals.denyAll('cancel');
 				const errMsg = p.turn.error?.message ?? 'Turn failed without error details';
 				stream.markdown(`\n\n❌ **Error:** ${errMsg}\n`);
 				session!.turnReject(new Error(errMsg));
 				return;
+			}
+			if (p.turn.status === 'interrupted') {
+				session!.pendingCommandApprovals.denyAll('cancel');
+				session!.pendingFileChangeApprovals.denyAll('cancel');
+				session!.pendingMcpApprovals.denyAll('cancel');
+				stream.markdown('\n\n⏹️ *Turn was cancelled.*\n');
+				session!.turnResolve();
+				return;
+			}
+			if (session!.pendingCommandApprovals.size > 0 || session!.pendingFileChangeApprovals.size > 0 || session!.pendingMcpApprovals.size > 0) {
+				log('turn completed with unresolved approvals', {
+					command: session!.pendingCommandApprovals.size,
+					fileChange: session!.pendingFileChangeApprovals.size,
+					mcp: session!.pendingMcpApprovals.size,
+				});
 			}
 			session!.turnResolve();
 		});
@@ -274,6 +484,9 @@ export class CodexParticipant {
 			} else if (item.type === 'dynamicToolCall') {
 				const name = item.namespace ? `${item.namespace}.${item.tool}` : item.tool;
 				setProgress(`Calling ${name}…`);
+			} else if (item.type === 'userMessage') {
+				// `userMessage` items are codex's echo of the user turn and are ignored
+				// until steering support is implemented in a later phase.
 			}
 		});
 
@@ -304,38 +517,50 @@ export class CodexParticipant {
 			stream.markdown(p.delta);
 		});
 		ts.on('item/fileChange/patchUpdated', (p: FileChangePatchUpdatedNotification) => { session!.pendingFileChanges.set(p.itemId, p.changes); });
-		ts.on('item/mcpToolCall/progress', () => {});
+
+		// ── MCP tool progress (MCP-07): stream progress messages instead of no-op ──
+		ts.on('item/mcpToolCall/progress', (p: McpToolCallProgressNotification) => {
+			if (p.message) {
+				stream.progress(`MCP: ${p.message}`);
+			}
+		});
+
 		ts.on('thread/tokenUsage/updated', (p: ThreadTokenUsageUpdatedNotification) => { if (p.tokenUsage.last) { log('token usage', p.tokenUsage.last); } });
 		ts.on('error', (err: Error) => {
 			session!.turnActive = false;
+			session!.currentAppTurnId = undefined;
 			session!.pendingCommandApprovals.denyAll('cancel');
 			session!.pendingFileChangeApprovals.denyAll('cancel');
+			session!.pendingMcpApprovals.denyAll('cancel');
 			session!.pendingToolCalls.rejectAll(err);
 			session!.turnReject(err);
 		});
 		conn.on('error', (err: Error) => {
 			session!.turnActive = false;
+			session!.currentAppTurnId = undefined;
 			session!.pendingCommandApprovals.denyAll('cancel');
 			session!.pendingFileChangeApprovals.denyAll('cancel');
+			session!.pendingMcpApprovals.denyAll('cancel');
 			session!.pendingToolCalls.rejectAll(err);
 			session!.turnReject(err);
 		});
 
-		// ── Requests (approval + dynamic tool calls) ──
+		// ── Requests (approval + dynamic tool calls + MCP) ──
 		ts.on('request', (req: unknown) => { void this._onRequest(request, stream, token, conn, session!, req); });
 
+		// ── Turn cancellation (§8): send turn/interrupt BEFORE rejecting ──
+		// Mirrors agent-host `codexAgent.abortSession` → `turn/interrupt`.
 		const cancelSub = token.onCancellationRequested(() => {
-			session!.turnActive = false;
-			session!.pendingCommandApprovals.denyAll('cancel');
-			session!.pendingFileChangeApprovals.denyAll('cancel');
-			session!.pendingToolCalls.rejectAll(new Error('Request cancelled'));
-			session!.turnReject(new Error('Request cancelled'));
+			log('cancellation requested', { threadId: codexThread.id, appTurnId: session!.currentAppTurnId });
+			void this._interruptTurn(conn, session!);
 		});
 
 		session.lastToolsHash = newToolsHash;
 		log('starting turn', { prompt: request.prompt.slice(0, 120), threadId: codexThread.id, modelId: request.model.id });
 		try {
-			await conn.startTurn({ threadId: codexThread.id, input: [{ type: 'text', text: request.prompt }], model: request.model.id, approvalPolicy: 'untrusted' });
+			const startResult = await conn.startTurn({ threadId: codexThread.id, input: [{ type: 'text', text: request.prompt }], model: request.model.id, approvalPolicy: 'untrusted' });
+			// Store the app-server turn id for cancellation (§8) and steering (§9).
+			session.currentAppTurnId = startResult.id;
 			await session.turnDone;
 		} finally {
 			ts.removeAllListeners();
@@ -345,6 +570,8 @@ export class CodexParticipant {
 
 		return { metadata: { threadId: codexThread.id } };
 	}
+
+	// ── Request dispatch (MCP-03, MCP-04, MCP-05, MCP-12) ──────────────────
 
 	private async _onRequest(
 		request: vscode.ChatRequest, stream: vscode.ChatResponseStream,
@@ -367,8 +594,170 @@ export class CodexParticipant {
 		} else if (msg.method === 'item/tool/call') {
 			const p = msg.params as unknown as DynamicToolCallParams;
 			void this._handleToolCall(request, token, conn, msg.id, session, p);
+		// ── MCP Tool Call Routing (MCP-03, MCP-12) ──
+		} else if (msg.method === 'mcpServer/tool/call') {
+			const p = msg.params as unknown as McpServerToolCallParams;
+			await this._handleMcpToolCall(request, token, conn, msg.id, session, p);
+		// ── MCP Tool Approval (MCP-04) ──
+		} else if (msg.method === 'item/tool/requestUserInput') {
+			const p = msg.params as unknown as ToolRequestUserInputParams;
+			await this._handleMcpApproval(request, stream, token, conn, msg.id, session, p);
+		// ── MCP Elicitation (MCP-05) ──
+		} else if (msg.method === 'mcpServer/elicitation/request') {
+			const p = msg.params as unknown as McpServerElicitationRequestParams;
+			await this._handleMcpElicitation(request, token, conn, msg.id, session, p);
 		}
 	}
+
+	// ── MCP Tool Call Handler (MCP-03, MCP-12) ─────────────────────────────
+
+	/**
+	 * Handle an `mcpServer/tool/call` RPC from the Codex app-server.
+	 * Forwards the call to the codex app-server which manages MCP server connections.
+	 * This is a passthrough — the app-server already has the MCP connection; the host
+	 * just needs to acknowledge the call.
+	 */
+	private async _handleMcpToolCall(
+		request: vscode.ChatRequest,
+		token: vscode.CancellationToken,
+		conn: AppServerConnection,
+		requestId: string | number,
+		session: SessionState,
+		params: McpServerToolCallParams,
+	): Promise<void> {
+		log('mcp tool call', { server: params.serverName, tool: params.toolName, threadId: params.threadId });
+
+		// Defensive: ensure a thread is materialized (MCP-08)
+		if (!session.thread?.id) {
+			logErr('MCP tool call before thread materialized', new Error('No thread'));
+			conn.respondToGeneric(requestId, {
+				content: [{ type: 'text', text: 'Error: No active thread for MCP tool call.' }],
+				isError: true,
+			} as McpServerToolCallResponse);
+			return;
+		}
+
+		try {
+			// The codex app-server manages MCP connections internally.
+			// Forward the request to the app-server which will execute the tool
+			// via its own MCP connection manager.
+			const response = await conn.mcpToolCall(params);
+			conn.respondToGeneric(requestId, response);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : 'Unknown MCP tool error';
+			logErr(`mcp tool call "${params.serverName}.${params.toolName}" failed`, err);
+			conn.respondToGeneric(requestId, {
+				content: [{ type: 'text', text: `Error: ${message}` }],
+				isError: true,
+			} as McpServerToolCallResponse);
+		}
+	}
+
+	// ── MCP Tool Approval Handler (MCP-04) ─────────────────────────────────
+
+	/**
+	 * Handle `item/tool/requestUserInput` for MCP tool approvals.
+	 * Codex surfaces MCP approvals with question IDs prefixed `mcp_tool_call_approval_`.
+	 * The host intercepts and shows a confirmation dialog, answering `Allow` or `__codex_mcp_decline__`.
+	 */
+	private async _handleMcpApproval(
+		request: vscode.ChatRequest,
+		stream: vscode.ChatResponseStream,
+		token: vscode.CancellationToken,
+		conn: AppServerConnection,
+		requestId: string | number,
+		session: SessionState,
+		params: ToolRequestUserInputParams,
+	): Promise<void> {
+		// Check if any question is an MCP tool approval
+		const mcpApprovalQ = params.questions.find(q => q.id.startsWith('mcp_tool_call_approval_'));
+		if (!mcpApprovalQ) {
+			// Non-MCP requestUserInput — respond with defaults
+			const answers: ToolRequestUserInputAnswer[] = params.questions.map(q => ({
+				questionId: q.id,
+				value: q.defaultValue ?? '',
+			}));
+			conn.respondToGeneric(requestId, { answers } as ToolRequestUserInputResponse);
+			return;
+		}
+
+		stream.progress(`MCP tool approval: ${mcpApprovalQ.label}`);
+		const key = String(requestId);
+		session.pendingMcpApprovals.register(key);
+
+		try {
+			const r = await vscode.lm.invokeTool('vscode_get_confirmation', {
+				input: {
+					title: `MCP Tool: ${mcpApprovalQ.label}`,
+					message: mcpApprovalQ.description ?? 'Codex wants to call an MCP tool. Allow?',
+					confirmationType: 'basic',
+				},
+				toolInvocationToken: request.toolInvocationToken,
+			}, token);
+			const v = (r.content.at(0) as { value?: unknown } | undefined)?.value;
+			const approved = typeof v === 'string' && v.toLowerCase() === 'yes';
+
+			const answers: ToolRequestUserInputAnswer[] = params.questions.map(q => ({
+				questionId: q.id,
+				value: q.id.startsWith('mcp_tool_call_approval_')
+					? (approved ? 'Allow' : '__codex_mcp_decline__')
+					: q.defaultValue ?? '',
+			}));
+			conn.respondToGeneric(requestId, { answers } as ToolRequestUserInputResponse);
+			session.pendingMcpApprovals.respond(key, approved ? 'accept' : 'decline');
+		} catch {
+			try {
+				conn.respondToGeneric(requestId, {
+					answers: params.questions.map(q => ({
+						questionId: q.id,
+						value: q.id.startsWith('mcp_tool_call_approval_') ? '__codex_mcp_decline__' : (q.defaultValue ?? ''),
+					})),
+				} as ToolRequestUserInputResponse);
+			} catch { /* connection dead */ }
+			session.pendingMcpApprovals.respond(key, 'cancel');
+		}
+	}
+
+	// ── MCP Elicitation Handler (MCP-05) ───────────────────────────────────
+
+	/**
+	 * Handle `mcpServer/elicitation/request` — host-side replacement for MCP
+	 * elicitation since `features.tool_call_mcp_elicitation=false` is passed.
+	 */
+	private async _handleMcpElicitation(
+		request: vscode.ChatRequest,
+		token: vscode.CancellationToken,
+		conn: AppServerConnection,
+		requestId: string | number,
+		session: SessionState,
+		params: McpServerElicitationRequestParams,
+	): Promise<void> {
+		log('mcp elicitation', { server: params.serverName, message: params.message });
+
+		try {
+			const r = await vscode.lm.invokeTool('vscode_get_confirmation', {
+				input: {
+					title: `MCP Server "${params.serverName}" Requests`,
+					message: params.message || 'The MCP server is requesting user input.',
+					confirmationType: 'basic',
+				},
+				toolInvocationToken: request.toolInvocationToken,
+			}, token);
+			const v = (r.content.at(0) as { value?: unknown } | undefined)?.value;
+			const approved = typeof v === 'string' && v.toLowerCase() === 'yes';
+			conn.respondToGeneric(requestId, {
+				decision: approved ? 'accept' : 'cancel',
+			} as McpServerElicitationRequestResponse);
+		} catch {
+			try {
+				conn.respondToGeneric(requestId, {
+					decision: 'cancel',
+				} as McpServerElicitationRequestResponse);
+			} catch { /* connection dead */ }
+		}
+	}
+
+	// ── Existing approval handlers ─────────────────────────────────────────
 
 	private async _approveCommand(
 		request: vscode.ChatRequest, stream: vscode.ChatResponseStream,
@@ -383,9 +772,6 @@ export class CodexParticipant {
 		if (p.reason) { lines.push(`**Reason:** ${p.reason}`); }
 
 		const key = String(id);
-		// Park a deferred — on disconnect/cancel, denyAll resolves it so
-		// we have a clean exit. We don't await the deferred; it's purely
-		// for teardown safety.
 		session.pendingCommandApprovals.register(key);
 
 		try {
@@ -398,8 +784,6 @@ export class CodexParticipant {
 			conn.respondToApproval(id, decision);
 			session.pendingCommandApprovals.respond(key, decision);
 		} catch {
-			// Prompt failed (cancelled, disconnected, etc.) — denyAll may have
-			// already resolved the deferred, but respond to the RPC either way.
 			try { conn.respondToApproval(id, 'cancel'); } catch { /* connection dead */ }
 			session.pendingCommandApprovals.respond(key, 'cancel');
 		}
@@ -434,10 +818,10 @@ export class CodexParticipant {
 	}
 
 	dispose(): void {
-		// Deny all pending approvals and reject tool calls on teardown.
 		for (const session of this._sessions.values()) {
 			session.pendingCommandApprovals.denyAll('cancel');
 			session.pendingFileChangeApprovals.denyAll('cancel');
+			session.pendingMcpApprovals.denyAll('cancel');
 			session.pendingToolCalls.rejectAll(new Error('Session disposed'));
 			if (session.turnActive) {
 				session.turnActive = false;
@@ -445,17 +829,13 @@ export class CodexParticipant {
 			}
 		}
 		this._sessions.clear();
+		this._mcpInventory.clear();
 		this.nativeConn?.disconnect(); this.nativeConn = null;
 		this.proxyConn?.disconnect(); this.proxyConn = null;
 	}
 
 	// ── Dynamic tool call dispatch ─────────────────────────────────────────
 
-	/**
-	 * Handle an item/tool/call request from the Codex app-server.
-	 * Routes the tool invocation to VS Code's `vscode.lm.invokeTool` or a fallback
-	 * built-in dispatcher.
-	 */
 	private async _handleToolCall(
 		request: vscode.ChatRequest,
 		token: vscode.CancellationToken,
@@ -465,13 +845,8 @@ export class CodexParticipant {
 		params: DynamicToolCallParams,
 	): Promise<void> {
 		const toolName = params.tool;
-
-		// Park a deferred so disconnect/cancellation can reject it.
 		const resultPromise = session.pendingToolCalls.register(String(requestId));
 
-		// Start the invocation — resultPromise will be resolved by one of:
-		// - _invokeTool success / failure below
-		// - disconnect → rejectAll → this await throws
 		try {
 			const result = await this._invokeTool(toolName, params.arguments as Record<string, unknown>, request, token);
 			conn.respondToToolCall(requestId, {
@@ -496,25 +871,18 @@ export class CodexParticipant {
 		}
 	}
 
-	/**
-	 * Invoke a VS Code language model tool by name.
-	 * Primary path: `vscode.lm.invokeTool()` (proposed `languageModelTool` API).
-	 * Fallback: built-in dispatcher for common tools.
-	 */
 	private async _invokeTool(
 		toolName: string,
 		args: Record<string, unknown>,
 		request: vscode.ChatRequest,
 		token: vscode.CancellationToken,
 	): Promise<string> {
-		// Primary: vscode.lm.invokeTool
 		if (typeof (vscode.lm as { invokeTool?: unknown }).invokeTool === 'function') {
 			try {
 				const result = await vscode.lm.invokeTool(toolName, {
 					input: args,
 					toolInvocationToken: request.toolInvocationToken,
 				}, token);
-				// Convert result content to a string for Codex
 				const text = result.content
 					.map(part => (typeof part === 'object' && part !== null && 'value' in part ? String(part.value) : JSON.stringify(part)))
 					.join('\n');
@@ -524,14 +892,9 @@ export class CodexParticipant {
 			}
 		}
 
-		// Fallback dispatcher
 		return this._fallbackInvokeTool(toolName, args, token);
 	}
 
-	/**
-	 * Fallback tool dispatcher for when vscode.lm.invokeTool is unavailable.
-	 * Handles the most common VS Code built-in tools.
-	 */
 	private async _fallbackInvokeTool(toolName: string, args: Record<string, unknown>, token: vscode.CancellationToken): Promise<string> {
 		const workspaceFolders = vscode.workspace.workspaceFolders;
 		const root = workspaceFolders?.[0]?.uri.fsPath;
@@ -554,7 +917,6 @@ export class CodexParticipant {
 			case 'searchContent': {
 				const pattern = args.pattern as string;
 				if (!pattern) { throw new Error('Missing required parameter: pattern'); }
-				// Fallback: use the vscode proposed API via type cast
 				const findTextInFiles = (vscode.workspace as unknown as { findTextInFiles(query: unknown, options: unknown, token: vscode.CancellationToken): Thenable<{ matches: Array<{ uri: vscode.Uri; ranges: Array<{ start: { line: number } }> }> }> }).findTextInFiles;
 				if (typeof findTextInFiles !== 'function') {
 					return `Content search for "${pattern}" requires vscode.lm.invokeTool`;
@@ -596,33 +958,4 @@ export class CodexParticipant {
 				throw new Error(`Tool "${toolName}" is not available. Use vscode.lm.invokeTool or register a fallback.`);
 		}
 	}
-}
-
-function findMetaInHistory(
-	history: ReadonlyArray<vscode.ChatRequestTurn | vscode.ChatResponseTurn>,
-): TurnMetadata | undefined {
-	for (let i = history.length - 1; i >= 0; i--) {
-		const turn = history[i];
-		if ('result' in turn) {
-			const meta = (turn as vscode.ChatResponseTurn).result.metadata;
-			const threadId = meta?.threadId;
-			if (typeof threadId === 'string') {
-				return { threadId };
-			}
-		}
-	}
-}
-
-/**
- * Compute a deterministic hash from a DynamicToolSpec array for change detection.
- */
-function hashTools(tools: DynamicToolSpec[]): string {
-	if (!tools.length) {
-		return 'empty';
-	}
-	const normalized = tools
-		.map(t => `${t.name}:${JSON.stringify(t.inputSchema)}`)
-		.sort()
-		.join('|');
-	return normalized;
 }
