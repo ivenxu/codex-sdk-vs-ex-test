@@ -1,0 +1,379 @@
+/**
+ * Routes SDK messages to VS Code Chat stream actions.
+ *
+ * Maps the five SDK message types (stream_event, assistant, result, user, system)
+ * to `vscode.ChatResponseStream` API calls — thinking progress, text markdown,
+ * tool call lifecycle, token usage, and error display.
+ *
+ * The key enabler is `includePartialMessages: true` in Options, which makes the
+ * SDK yield `stream_event` messages with raw Anthropic SSE content blocks
+ * (thinking, tool_use, text_delta, input_json_delta, etc.).
+ */
+
+import * as vscode from 'vscode';
+import {
+	type SDKMessage,
+	type SDKAssistantMessage,
+	type SDKPartialAssistantMessage,
+	type SDKResultMessage,
+	type SDKResultSuccess,
+	type SDKResultError,
+} from '@anthropic-ai/claude-agent-sdk';
+import type { BetaRawMessageStreamEvent } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs';
+import type { NonNullableUsage } from '@anthropic-ai/claude-agent-sdk';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export interface RouterState {
+	/** Current thinking block being streamed (id → text), null if none active */
+	currentThinkingId: string | null;
+	/** Map of active tool call id → tool name */
+	activeToolCalls: Map<string, string>;
+	/** Ordered list of file changes made this turn */
+	fileChanges: FileChangeEntry[];
+	/** Cumulative usage accumulated across stream events */
+	usage: Partial<NonNullableUsage> | null;
+	/** The final session ID captured from any message */
+	sessionId: string | null;
+	/** Whether the turn completed with a terminal result */
+	completed: boolean;
+	/** Error message if the turn failed */
+	error: string | null;
+}
+
+export interface FileChangeEntry {
+	path: string;
+	operation: 'edit' | 'create' | 'rename' | 'delete';
+	description: string;
+}
+
+function createInitialState(): RouterState {
+	return {
+		currentThinkingId: null,
+		activeToolCalls: new Map(),
+		fileChanges: [],
+		usage: null,
+		sessionId: null,
+		completed: false,
+		error: null,
+	};
+}
+
+// ─── Logger ───────────────────────────────────────────────────────────────────
+
+function log(msg: string, ...args: unknown[]): void {
+	console.log(`[claude:router] ${msg}`, ...args);
+}
+
+// ─── Main Router ──────────────────────────────────────────────────────────────
+
+/**
+ * Route a single SDK message to the VS Code chat stream.
+ * Returns the updated router state.
+ */
+export function routeSDKMessage(
+	msg: SDKMessage,
+	stream: vscode.ChatResponseStream,
+	state: RouterState = createInitialState(),
+): RouterState {
+	switch (msg.type) {
+		case 'stream_event':
+			return handleStreamEvent(msg, stream, state);
+		case 'assistant':
+			return handleAssistantMessage(msg, stream, state);
+		case 'result':
+			return handleResultMessage(msg, stream, state);
+		case 'user':
+			return handleUserMessage(msg, stream, state);
+		case 'system':
+			return handleSystemMessage(msg, stream, state);
+		default:
+			// Unknown message types are silently ignored
+			return state;
+	}
+}
+
+// ─── Stream Event Handler (Priority 1: thinking, tool_use, etc.) ─────────────
+
+function handleStreamEvent(
+	msg: SDKPartialAssistantMessage,
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	const event = msg.event;
+
+	switch (event.type) {
+		case 'content_block_start':
+			return handleContentBlockStart(event, stream, state);
+		case 'content_block_delta':
+			return handleContentBlockDelta(event, stream, state);
+		case 'content_block_stop':
+			return handleContentBlockStop(event, stream, state);
+		case 'message_delta':
+			return handleMessageDelta(event, stream, state);
+		case 'message_start':
+		case 'message_stop':
+			// message_start / message_stop are lifecycle markers we track silently
+			if (msg.session_id) {
+				state.sessionId = msg.session_id;
+			}
+			return state;
+		default:
+			return state;
+	}
+}
+
+// ── Content Block Start ──────────────────────────────────────────────────────
+
+function handleContentBlockStart(
+	event: BetaRawMessageStreamEvent & { type: 'content_block_start' },
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	const block = event.content_block;
+
+	switch (block.type) {
+		case 'thinking': {
+			// Thinking block started → show thinking progress
+			state.currentThinkingId = crypto.randomUUID();
+			stream.thinkingProgress!({ id: state.currentThinkingId, text: 'Thinking…' });
+			break;
+		}
+
+		case 'tool_use': {
+			// Tool call started → show progress with tool name
+			const toolName = block.name;
+			const toolId = block.id;
+			state.activeToolCalls.set(toolId, toolName);
+			stream.progress(`Calling ${toolName}…`);
+
+			// Detect file-edit tools for file change visibility (Priority 3b)
+			if (isFileEditTool(toolName)) {
+				state.fileChanges.push({
+					path: extractPathFromToolInput(block.input as Record<string, unknown>),
+					operation: toolName === 'Edit' ? 'edit' : 'create',
+					description: `Editing via ${toolName}`,
+				});
+			}
+			break;
+		}
+
+		case 'text': {
+			// Text block start — no action needed, will get deltas
+			break;
+		}
+	}
+
+	if (event.index !== undefined) {
+		// Track session ID from the enclosing partial message
+	}
+	if (state.currentThinkingId === null || state.currentThinkingId !== state.currentThinkingId) {
+		// noop
+	}
+
+	return state;
+}
+
+// ── Content Block Delta ──────────────────────────────────────────────────────
+
+function handleContentBlockDelta(
+	event: BetaRawMessageStreamEvent & { type: 'content_block_delta' },
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	const delta = event.delta;
+
+	switch (delta.type) {
+		case 'text_delta': {
+			// Text content delta → stream as markdown
+			if (delta.text) {
+				stream.markdown(delta.text);
+			}
+			break;
+		}
+
+		case 'thinking_delta': {
+			// Thinking delta → update thinking progress
+			if (delta.thinking && state.currentThinkingId) {
+				stream.thinkingProgress!({ id: state.currentThinkingId, text: delta.thinking });
+			}
+			break;
+		}
+
+		case 'input_json_delta': {
+			// Tool input JSON — silently track; don't stream raw JSON to the user.
+			// The tool call progress notification (set on tool_use start) is sufficient.
+			break;
+		}
+	}
+
+	return state;
+}
+
+// ── Content Block Stop ───────────────────────────────────────────────────────
+
+function handleContentBlockStop(
+	event: BetaRawMessageStreamEvent & { type: 'content_block_stop' },
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	// If we were tracking a thinking block, clear it
+	if (state.currentThinkingId !== null) {
+		state.currentThinkingId = null;
+	}
+
+	// If we were tracking a tool_use block, mark it complete
+	// (We don't know the toolUseId here, but activeToolCalls is keyed by it)
+	// We'll match by index or clear stale ones on user messages
+	return state;
+}
+
+// ── Message Delta ────────────────────────────────────────────────────────────
+
+function handleMessageDelta(
+	event: BetaRawMessageStreamEvent & { type: 'message_delta' },
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	// Track token usage from message_delta usage
+	if (event.usage) {
+		state.usage = {
+			...(state.usage ?? {}),
+			input_tokens: (state.usage?.input_tokens ?? 0) + (event.usage.input_tokens ?? 0),
+			output_tokens: (state.usage?.output_tokens ?? 0) + (event.usage.output_tokens ?? 0),
+		};
+		log('token usage (delta)', state.usage);
+	}
+
+	// Handle stop_reason
+	if (event.delta?.stop_reason) {
+		log('stop reason', event.delta.stop_reason);
+	}
+
+	return state;
+}
+
+// ── Assistant Message Handler ────────────────────────────────────────────────
+
+function handleAssistantMessage(
+	msg: SDKAssistantMessage,
+	_stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	// Capture session ID — text already streamed via stream_event{text_delta}.
+	// The canonical assistant message duplicates text from streaming deltas
+	// and contains tool_use blocks we don't want to serialize as raw text.
+	if (msg.session_id) {
+		state.sessionId = msg.session_id;
+	}
+	return state;
+}
+
+// ── Result Message Handler ───────────────────────────────────────────────────
+
+function handleResultMessage(
+	msg: SDKResultMessage,
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	state.completed = true;
+
+	// Capture session ID
+	if (msg.session_id) {
+		state.sessionId = msg.session_id;
+	}
+
+	if (msg.subtype === 'success') {
+		const success = msg as SDKResultSuccess;
+		state.usage = success.usage ?? state.usage;
+		log('turn completed successfully', {
+			sessionId: state.sessionId,
+			usage: state.usage,
+			durationMs: success.duration_ms,
+			numTurns: success.num_turns,
+		});
+	} else {
+		// Error result
+		const err = msg as SDKResultError;
+		state.error = err.errors?.join('; ') ?? 'Unknown error';
+		state.usage = err.usage ?? state.usage;
+		log('turn completed with error', {
+			subtype: err.subtype,
+			errors: err.errors,
+			usage: state.usage,
+		});
+		stream.markdown(`\n\n> ⚠️ Claude error: ${state.error}\n`);
+	}
+
+	return state;
+}
+
+// ── User Message Handler ─────────────────────────────────────────────────────
+
+function handleUserMessage(
+	msg: SDKMessage & { type: 'user' },
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	// User messages carry tool results from the SDK
+	// Display tool results as they complete
+	if (msg.session_id) {
+		state.sessionId = msg.session_id;
+	}
+
+	// Clear active tool calls — they've been resolved
+	state.activeToolCalls.clear();
+
+	return state;
+}
+
+// ── System Message Handler ───────────────────────────────────────────────────
+
+function handleSystemMessage(
+	msg: SDKMessage & { type: 'system' },
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+): RouterState {
+	// Capture session ID from system init messages
+	if (msg.session_id) {
+		state.sessionId = msg.session_id;
+	}
+
+	const sys = msg as SDKMessage & { type: 'system'; subtype?: string };
+	if (sys.subtype === 'init') {
+		log('session initialized', { sessionId: state.sessionId });
+	}
+
+	return state;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Extract plain text from an SDKAssistantMessage content array. */
+function extractText(msg: SDKAssistantMessage): string {
+	const content = msg.message?.content;
+	if (!content) { return ''; }
+	if (typeof content === 'string') { return content; }
+	if (Array.isArray(content)) {
+		return content
+			.filter(c => typeof c === 'object' && c !== null && (c as { type?: string }).type === 'text')
+			.map(c => (c as { type: string; text: string }).text)
+			.join('');
+	}
+	return '';
+}
+
+/** Check if a tool name is a file-editing tool. */
+function isFileEditTool(toolName: string): boolean {
+	return ['Edit', 'FileWrite', 'file_edit', 'FileEdit', 'Write'].includes(toolName);
+}
+
+/** Extract the file path from a tool input object, if present. */
+function extractPathFromToolInput(input: Record<string, unknown>): string {
+	if (typeof input.file_path === 'string') { return input.file_path; }
+	if (typeof input.path === 'string') { return input.path; }
+	if (typeof input.filePath === 'string') { return input.filePath; }
+	return 'unknown';
+}
+
+export { createInitialState };

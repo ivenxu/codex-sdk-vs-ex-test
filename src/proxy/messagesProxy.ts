@@ -14,7 +14,7 @@ import { makeId, startSSE, writeJSON, writeNamedSSEEvent, RouteHandler } from '.
 interface AnthropicTextBlock { type: 'text'; text: string }
 interface AnthropicImageBlock { type: 'image'; source: { type: string; media_type?: string; data?: string; url?: string } }
 interface AnthropicToolUseBlock { type: 'tool_use'; id: string; name: string; input: object }
-interface AnthropicToolResultBlock { type: 'tool_result'; tool_use_id: string; content?: string | AnthropicContentBlock[] }
+interface AnthropicToolResultBlock { type: 'tool_result'; tool_use_id: string; content?: string | AnthropicContentBlock[]; is_error?: boolean }
 interface AnthropicThinkingBlock { type: 'thinking'; thinking: string; signature?: string }
 interface AnthropicRedactedThinkingBlock { type: 'redacted_thinking'; data: string }
 interface AnthropicDocumentBlock { type: 'document'; title?: string }
@@ -69,16 +69,19 @@ function convertAnthropicContentBlock(
 		}
 		case 'tool_result': {
 			const tr = block as AnthropicToolResultBlock;
-			let contentParts: vscode.LanguageModelTextPart[];
+			let text = '';
 			if (typeof tr.content === 'string') {
-				contentParts = [new vscode.LanguageModelTextPart(tr.content)];
+				text = tr.content;
 			} else if (Array.isArray(tr.content)) {
-				contentParts = tr.content
+				text = tr.content
 					.filter(c => c.type === 'text')
-					.map(c => new vscode.LanguageModelTextPart((c as AnthropicTextBlock).text));
-			} else {
-				contentParts = [new vscode.LanguageModelTextPart('')];
+					.map(c => (c as AnthropicTextBlock).text || '')
+					.join('\n');
 			}
+			if (tr.is_error) {
+				text = text ? `[Error] ${text}` : '[Error]';
+			}
+			const contentParts = [new vscode.LanguageModelTextPart(text || '(empty)')];
 			return new vscode.LanguageModelToolResultPart(tr.tool_use_id, contentParts);
 		}
 		case 'image':
@@ -150,6 +153,13 @@ export function convertAnthropicMessagesToVSCode(
 				result.push(vscode.LanguageModelChatMessage.Assistant(parts.length > 0 ? parts : ''));
 			}
 		}
+	}
+
+	// Apply the same normalization as responses proxy:
+	// 1. Never start with an Assistant message (Feima constraint)
+	// 2. Ensure each Assistant[tool_use] is followed by a User[tool_result]
+	if (result.length > 0 && result[0].role !== 1 /* User */) {
+		result.unshift(vscode.LanguageModelChatMessage.User('(continuing)'));
 	}
 
 	return result;

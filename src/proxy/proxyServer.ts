@@ -95,9 +95,16 @@ export class ProxyServer {
 				return;
 			}
 
-			// Nonce auth
+			// HEAD / is a health check — respond without auth
+			if (method === 'HEAD') {
+				res.writeHead(200);
+				res.end();
+				return;
+			}
+
+			// Nonce auth — accept Bearer <nonce> or Bearer <nonce>.<sessionId>
 			const auth = (req.headers['authorization'] ?? '').toString();
-			if (auth !== `Bearer ${this.nonce}`) {
+			if (!auth.startsWith(`Bearer ${this.nonce}`)) {
 				console.warn(`[proxy] 401 auth mismatch — got: ${auth.slice(0, 40)} expected Bearer ${this.nonce.slice(0, 8)}...`);
 				writeJSON(res, 401, { error: { type: 'authentication_error', message: 'Unauthorized' } });
 				return;
