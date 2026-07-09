@@ -123,41 +123,71 @@ export function convertAnthropicMessagesToVSCode(
 		}
 	}
 
+	// CRITICAL: Feima rejects User messages that mix LanguageModelTextPart
+	// with LanguageModelToolResultPart. We must split each Anthropic message
+	// into separate VS Code messages by part type, mirroring the responses
+	// proxy pattern where tool calls/results always get their own messages.
 	for (const msg of messages) {
 		const content = msg.content;
-		if (msg.role === 'user') {
-			if (typeof content === 'string') {
+
+		if (typeof content === 'string') {
+			// Simple string content — emit as-is
+			if (msg.role === 'user') {
 				result.push(vscode.LanguageModelChatMessage.User(content));
 			} else {
-				const parts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelToolResultPart> = [];
-				for (const block of content) {
-					const part = convertAnthropicContentBlock(block);
-					if (part instanceof vscode.LanguageModelTextPart || part instanceof vscode.LanguageModelToolResultPart) {
-						parts.push(part);
-					}
-				}
-				result.push(vscode.LanguageModelChatMessage.User(parts.length > 0 ? parts : ''));
+				result.push(vscode.LanguageModelChatMessage.Assistant(content));
+			}
+			continue;
+		}
+
+		// Array content: partition by part type, emit separately
+		const textParts: vscode.LanguageModelTextPart[] = [];
+		const toolCallParts: vscode.LanguageModelToolCallPart[] = [];
+		const toolResultParts: vscode.LanguageModelToolResultPart[] = [];
+
+		for (const block of content) {
+			const part = convertAnthropicContentBlock(block);
+			if (!part) { continue; }
+			if (part instanceof vscode.LanguageModelTextPart) {
+				textParts.push(part);
+			} else if (part instanceof vscode.LanguageModelToolCallPart) {
+				toolCallParts.push(part);
+			} else if (part instanceof vscode.LanguageModelToolResultPart) {
+				toolResultParts.push(part);
+			}
+		}
+
+		if (msg.role === 'assistant') {
+			// Emit text first, then tool calls — each in its own message
+			if (textParts.length > 0) {
+				result.push(vscode.LanguageModelChatMessage.Assistant(textParts));
+			}
+			if (toolCallParts.length > 0) {
+				result.push(vscode.LanguageModelChatMessage.Assistant(toolCallParts));
 			}
 		} else {
-			// assistant
-			if (typeof content === 'string') {
-				result.push(vscode.LanguageModelChatMessage.Assistant(content));
+			// user role: emit text and tool_results in SEPARATE messages
+			// The tool_results must immediately follow any preceding
+			// Assistant[tool_use] message, so emit results first, then text.
+			if (toolResultParts.length > 0) {
+				result.push(vscode.LanguageModelChatMessage.User(toolResultParts));
+			}
+			if (textParts.length > 0) {
+				result.push(vscode.LanguageModelChatMessage.User(textParts));
+			}
+		}
+
+		// If a message produced no usable parts at all, emit a placeholder
+		if (textParts.length === 0 && toolCallParts.length === 0 && toolResultParts.length === 0) {
+			if (msg.role === 'user') {
+				result.push(vscode.LanguageModelChatMessage.User(''));
 			} else {
-				const parts: Array<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart> = [];
-				for (const block of content) {
-					const part = convertAnthropicContentBlock(block);
-					if (part instanceof vscode.LanguageModelTextPart || part instanceof vscode.LanguageModelToolCallPart) {
-						parts.push(part);
-					}
-				}
-				result.push(vscode.LanguageModelChatMessage.Assistant(parts.length > 0 ? parts : ''));
+				result.push(vscode.LanguageModelChatMessage.Assistant(''));
 			}
 		}
 	}
 
-	// Apply the same normalization as responses proxy:
-	// 1. Never start with an Assistant message (Feima constraint)
-	// 2. Ensure each Assistant[tool_use] is followed by a User[tool_result]
+	// Never start with an Assistant message — Feima constraint
 	if (result.length > 0 && result[0].role !== 1 /* User */) {
 		result.unshift(vscode.LanguageModelChatMessage.User('(continuing)'));
 	}
