@@ -43,7 +43,8 @@ export function activate(context: vscode.ExtensionContext): void {
 	// @github/copilot-sdk auto-discovers the bundled @github/copilot runtime.
 	// baseDirectory is set to the extension's own storage to isolate sessions
 	// from VS Code's built-in Copilot CLI agent which uses ~/.copilot.
-	const copilotParticipant = new CopilotParticipant(context.globalStorageUri.fsPath);
+	// The runtime's model calls are always routed through proxyManager → VS Code LM.
+	const copilotParticipant = new CopilotParticipant(context.globalStorageUri.fsPath, proxyManager);
 	const copilotChat = vscode.chat.createChatParticipant(
 		'copilot-cli.participant',
 		copilotParticipant.handleRequest.bind(copilotParticipant)
