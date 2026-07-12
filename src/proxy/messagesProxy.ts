@@ -54,6 +54,23 @@ interface MessagesRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Model encoding: parse "vendor/modelId" format for precise proxy lookup
+// ---------------------------------------------------------------------------
+
+interface ParsedModel {
+	vendor: string | null;
+	modelId: string;
+}
+
+function parseModelEncoding(raw: string): ParsedModel {
+	const idx = raw.indexOf('/');
+	if (idx !== -1) {
+		return { vendor: raw.slice(0, idx), modelId: raw.slice(idx + 1) };
+	}
+	return { vendor: null, modelId: raw };
+}
+
+// ---------------------------------------------------------------------------
 // Input conversion: Anthropic messages → vscode.LanguageModelChatMessage[]
 // ---------------------------------------------------------------------------
 
@@ -361,20 +378,33 @@ async function streamMessagesSSE(
 				}
 			}
 		}
-	} catch { /* stream errors handled by VS Code */ }
+	} catch (err) {
+		// Stream errors: cancellation (TypeError: terminated) is expected when
+		// the client disconnects or the request is aborted — suppress logging.
+		if (err instanceof TypeError && (err.message === 'terminated' || err.message.includes('aborted'))) {
+			// Expected cancellation — clean up silently
+		} else {
+			console.error('[messages-proxy] stream error', err);
+		}
+	}
 
 	// Close any open text block
 	closeTextBlock();
 
-	// Finalize
-	writeNamedSSEEvent(res, 'message_delta', {
-		type: 'message_delta',
-		delta: { stop_reason: stopReason, stop_sequence: null },
-		usage: { output_tokens: outputTokens },
-	});
-	writeNamedSSEEvent(res, 'message_stop', { type: 'message_stop' });
-
-	res.end();
+	// Finalize — guard against write-after-abort (client disconnected mid-stream)
+	try {
+		if (!res.writableEnded) {
+			writeNamedSSEEvent(res, 'message_delta', {
+				type: 'message_delta',
+				delta: { stop_reason: stopReason, stop_sequence: null },
+				usage: { output_tokens: outputTokens },
+			});
+			writeNamedSSEEvent(res, 'message_stop', { type: 'message_stop' });
+			res.end();
+		}
+	} catch {
+		// Response already closed by client — safe to ignore
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -402,7 +432,12 @@ async function collectMessagesResponse(
 				toolCalls.push({ id: part.callId, name: part.name, input: part.input });
 			}
 		}
-	} catch { /* ignore */ }
+	} catch (err) {
+		// Cancellation is expected — suppress noisy TypeError: terminated
+		if (!(err instanceof TypeError && (err.message === 'terminated' || err.message.includes('aborted')))) {
+			console.error('[messages-proxy] collect error', err);
+		}
+	}
 
 	const content: unknown[] = [];
 	if (text) { content.push({ type: 'text', text }); }
@@ -439,8 +474,19 @@ export function createMessagesHandler(): RouteHandler {
 			return;
 		}
 
-		// Model lookup — consumer provides exact ID
-		const models = await vscode.lm.selectChatModels({ id: req.model });
+		// Model lookup — consumer may encode as "vendor::modelId".
+		// Parse the encoding to do a precise vendor+id lookup vs id-only fallback.
+		const parsedModel = parseModelEncoding(req.model);
+		const modelSelector: vscode.LanguageModelChatSelector = parsedModel.vendor
+			? { vendor: parsedModel.vendor, id: parsedModel.modelId }
+			: { id: parsedModel.modelId };
+		let models = await vscode.lm.selectChatModels(modelSelector);
+		if (models.length === 0) {
+			// Try id-only fallback if vendor-filtered lookup fails
+			if (parsedModel.vendor) {
+				models = await vscode.lm.selectChatModels({ id: parsedModel.modelId });
+			}
+		}
 		if (models.length === 0) {
 			writeJSON(res, 404, { type: 'error', error: { type: 'not_found_error', message: `Model '${req.model}' not found` } });
 			return;
@@ -505,7 +551,13 @@ export function createMessagesCountTokensHandler(): RouteHandler {
 			writeJSON(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'model and messages are required' } });
 			return;
 		}
-		const models = await vscode.lm.selectChatModels({ id: req.model });
+		const parsedModel = parseModelEncoding(req.model);
+		let models = await vscode.lm.selectChatModels(parsedModel.vendor
+			? { vendor: parsedModel.vendor, id: parsedModel.modelId }
+			: { id: parsedModel.modelId });
+		if (models.length === 0 && parsedModel.vendor) {
+			models = await vscode.lm.selectChatModels({ id: parsedModel.modelId });
+		}
 		if (models.length === 0) {
 			writeJSON(res, 404, { type: 'error', error: { type: 'not_found_error', message: `Model '${req.model}' not found` } });
 			return;
