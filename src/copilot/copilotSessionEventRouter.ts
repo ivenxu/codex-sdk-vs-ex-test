@@ -34,6 +34,8 @@ export interface TokenUsage {
 export interface RouterState {
 	/** Id of the reasoning block currently being streamed, or null. */
 	currentReasoningId: string | null;
+	/** Reasoning IDs that have already received delta events (used to skip the final full-text event). */
+	reasoningIdsWithDeltas: Set<string>;
 	/** Active tool calls: toolCallId → toolName. */
 	activeToolCalls: Map<string, string>;
 	/** Cumulative token usage for this turn. */
@@ -47,6 +49,7 @@ export interface RouterState {
 export function createInitialRouterState(): RouterState {
 	return {
 		currentReasoningId: null,
+		reasoningIdsWithDeltas: new Set(),
 		activeToolCalls: new Map(),
 		usage: { inputTokens: 0, outputTokens: 0 },
 		modelId: null,
@@ -68,13 +71,29 @@ export function routeSessionEvent(
 ): RouterState {
 	switch (event.type) {
 		case 'assistant.reasoning': {
-			state.currentReasoningId = event.data.reasoningId;
-			stream.thinkingProgress?.({ id: event.data.reasoningId, text: event.data.content ?? '' });
+			// This event fires AFTER all deltas with the complete reasoning text.
+			// Only display it when no deltas were received (non-streaming fallback).
+			if (!state.reasoningIdsWithDeltas.has(event.data.reasoningId)) {
+				const text = event.data.content ?? '';
+				if (text) {
+					stream.thinkingProgress!({ id: event.data.reasoningId, text });
+				}
+			}
+			state.currentReasoningId = null;
 			return state;
 		}
 		case 'assistant.reasoning_delta': {
-			state.currentReasoningId = event.data.reasoningId;
-			stream.thinkingProgress?.({ id: event.data.reasoningId, text: event.data.deltaContent ?? '' });
+			const id = event.data.reasoningId;
+			if (!state.reasoningIdsWithDeltas.has(id)) {
+				// Open the thinking block on the first delta.
+				state.reasoningIdsWithDeltas.add(id);
+				stream.thinkingProgress!({ id, text: 'Thinking…\n' });
+			}
+			state.currentReasoningId = id;
+			const delta = event.data.deltaContent;
+			if (delta) {
+				stream.thinkingProgress!({ id, text: delta });
+			}
 			return state;
 		}
 		case 'assistant.message_delta': {

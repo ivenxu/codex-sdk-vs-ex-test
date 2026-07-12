@@ -102,10 +102,14 @@ export class ProxyServer {
 				return;
 			}
 
-			// Nonce auth — accept Bearer <nonce> or Bearer <nonce>.<sessionId>
+			// Nonce auth — accept the nonce via `Authorization: Bearer <nonce>`
+			// (OpenAI/Claude SDKs) or `x-api-key: <nonce>` (Copilot BYOK providers,
+			// which send `COPILOT_PROVIDER_API_KEY` in the Anthropic-style header).
 			const auth = (req.headers['authorization'] ?? '').toString();
-			if (!auth.startsWith(`Bearer ${this.nonce}`)) {
-				console.warn(`[proxy] 401 auth mismatch — got: ${auth.slice(0, 40)} expected Bearer ${this.nonce.slice(0, 8)}...`);
+			const apiKey = (req.headers['x-api-key'] ?? '').toString();
+			const authorized = auth.startsWith(`Bearer ${this.nonce}`) || apiKey.startsWith(this.nonce);
+			if (!authorized) {
+				console.warn(`[proxy] 401 auth mismatch — authorization: ${auth.slice(0, 40)} x-api-key: ${apiKey.slice(0, 12)} expected ${this.nonce.slice(0, 8)}...`);
 				writeJSON(res, 401, { error: { type: 'authentication_error', message: 'Unauthorized' } });
 				return;
 			}

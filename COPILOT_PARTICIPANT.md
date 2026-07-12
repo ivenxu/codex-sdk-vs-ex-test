@@ -325,7 +325,74 @@ Other slash commands:
 
 ---
 
-## 10. Comparison: Codex vs Claude vs Copilot
+## 11. Shell Tool on Linux / WSL: `SHELL_SPAWN_BACKEND`
+
+### The problem
+
+The Copilot CLI's built-in shell tool uses the **MXC bubblewrap sandbox engine**
+(`@microsoft/mxc-sdk/bin`) to execute shell commands in an isolated environment.
+The VS Code host-agent distribution ships the MXC binaries and sets `MXC_BIN_DIR`
+in the subprocess env so the CLI finds them. A standalone VS Code extension has
+no MXC binaries in its `node_modules` (`@microsoft/mxc-sdk` is not present).
+
+Without the sandbox engine the CLI tries to start a sandboxed shell, the sandbox
+process never materialises, and the tool eventually surfaces as:
+
+```
+> ⚠️ Tool failed: timeout
+```
+
+### Confirmed environment (verified 2026-07-10)
+
+| Check | Result |
+|---|---|
+| VS Code server node binary | ELF 64-bit Linux (`/home/iven/.vscode-server-insiders/.../node`) |
+| `process.platform` | `linux` |
+| `WSL_DISTRO_NAME` | `Ubuntu-22.04` |
+| CLI binary resolved | `@github/copilot-linux-x64/copilot` (143 MB ELF) |
+| `@microsoft/mxc-sdk` | **not present** in extension `node_modules` |
+
+The subprocess is a **native Linux process** — not Windows. Paths like
+`/home/iven/…` are accessible. The timeout is purely the missing sandbox engine.
+
+### The fix: `SHELL_SPAWN_BACKEND` feature flag
+
+On Linux, `_ensureClient()` sets:
+
+```typescript
+if (process.platform === 'linux') {
+    env['COPILOT_CLI_ENABLED_FEATURE_FLAGS'] = [
+        ...(existingFlags),
+        'SHELL_SPAWN_BACKEND',
+    ].join(',');
+}
+```
+
+`SHELL_SPAWN_BACKEND` tells the CLI to use a **non-sandboxed pipe-based spawn**
+for each shell command instead of the PTY-backed bubblewrap path. This works
+correctly in both native Linux and WSL without any additional binaries.
+
+The VS Code host agent (`copilotAgent.ts → _ensureClient`) sets the same flag on
+Linux for the same reason:
+
+```typescript
+// VS Code host agent (copilotAgent.ts)
+if (process.platform === 'linux') {
+    flags.add('SHELL_SPAWN_BACKEND');
+    env['COPILOT_CLI_ENABLED_FEATURE_FLAGS'] = [...flags].join(',');
+}
+```
+
+### Other tool failures that are NOT sandbox-related
+
+Some tool errors that appear alongside `timeout` are unrelated to the sandbox and
+are caused by the model generating bad tool inputs:
+
+| Error | Cause |
+|---|---|
+| `Search paths do not exist: /home/iven/*` | Model used a shell glob in a path arg; the CLI doesn’t expand globs, treats it as a literal (missing) path |
+| `"view_range": Expected array, received null` | Model passed `null` for a parameter that requires an array |
+| `Path does not exist` | Model hallucinated a file path that doesn’t exist in the workspace |
 
 | Feature | Codex | Claude | Copilot |
 |---|---|---|---|
@@ -343,7 +410,7 @@ Other slash commands:
 
 ---
 
-## 11. File Inventory
+## 12. File Inventory
 
 | File | Lines | Purpose |
 |---|---|---|

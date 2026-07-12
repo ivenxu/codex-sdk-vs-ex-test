@@ -4,6 +4,8 @@ import {
 	RuntimeConnection,
 	type SessionConfig,
 	type ResumeSessionConfig,
+	type NamedProviderConfig,
+	type ProviderModelConfig,
 	type PermissionRequestResult,
 	type ExitPlanModeRequest,
 	type ExitPlanModeResult,
@@ -97,7 +99,7 @@ export class CopilotParticipant {
 		}
 		log('authenticated', { account: githubSession.account.label });
 
-		// ── 2. Ensure client (handles token rotation) ────────────────────────
+		// ── 2. Ensure client (handles token rotation) ────────────────────
 		await this._ensureClient(githubSession.accessToken, stream);
 		const client = this._client!;
 
@@ -233,9 +235,11 @@ export class CopilotParticipant {
 			log('resuming session from disk', { sessionId: savedSessionId });
 			try {
 				const entry = this._newEntry();
+				const byok = this._byokSessionConfig(savedSessionId, request.model.id);
 				const resumeConfig: ResumeSessionConfig = {
 					workingDirectory: workspaceCwd(),
 					streaming: true,
+					...byok,
 					onPermissionRequest: this._permissionCallback(entry),
 					onExitPlanModeRequest: this._exitPlanModeCallback(entry),
 				};
@@ -247,12 +251,19 @@ export class CopilotParticipant {
 		}
 
 		stream.progress('Starting Copilot session…');
-		log('creating new session', { model: request.model.id });
+		const vendor = 'copilot';
+		const qualifiedModelId = `${vendor}/${request.model.id}`;
+		log('creating new session', { model: qualifiedModelId });
 		const entry = this._newEntry();
+		const byok = this._byokSessionConfig(/* sessionId unknown yet — use placeholder */ 'new', request.model.id);
 		const createConfig: SessionConfig = {
 			workingDirectory: workspaceCwd(),
-			model: request.model.id,
+			// Provider-qualified id ('copilot/gpt-4.1') tells the runtime to use the
+			// BYOK provider. A bare id would be treated as a CAPI model selection,
+			// bypassing the providers/models config entirely (SDK rpc.d.ts:6229).
+			model: qualifiedModelId,
 			streaming: true,
+			...byok,
 			onPermissionRequest: this._permissionCallback(entry),
 			onExitPlanModeRequest: this._exitPlanModeCallback(entry),
 		};
@@ -327,7 +338,7 @@ export class CopilotParticipant {
 
 	private async _ensureClient(githubToken: string, stream: vscode.ChatResponseStream): Promise<void> {
 		// Restart the client when the token rotates, but only when nothing is in
-		// flight (env is fixed at spawn time).
+		// flight (the client env is fixed at spawn; the model/provider are per-session).
 		const needsRestart = this._client !== null
 			&& this._lastToken !== githubToken
 			&& this._sessions.size === 0;
@@ -338,26 +349,34 @@ export class CopilotParticipant {
 		}
 		this._lastToken = githubToken;
 
+		// Ensure the localhost proxy is up so the per-session provider config can
+		// point at it (see `_providerConfig`).
+		await this.proxyManager.start();
+
 		if (!this._client) {
 			stream.progress('Connecting to Copilot CLI…');
 			const restrictedTelemetry = isRestrictedTelemetryEnabled(githubToken);
 
-			// Always route the runtime's model calls through our localhost proxy →
-			// VS Code LM. `COPILOT_API_URL` overrides the model endpoint; the picked
-			// model flows via the per-session `model` id in the request body; disabling
-			// WebSocket keeps all traffic on the HTTP Responses transport the proxy
-			// understands. (`gitHubToken` only authenticates the runtime itself — it
-			// does not select the model, which always resolves through the proxy.)
-			const info = await this.proxyManager.start();
-			log('model proxy', { responsesUrl: info.responsesUrl });
-			const env: Record<string, string | undefined> = {
-				...process.env,
-				COPILOT_API_URL: info.responsesUrl,
-				GITHUB_COPILOT_API_TOKEN: info.responsesNonce,
-				COPILOT_CLI_DISABLE_WEBSOCKET_RESPONSES: 'true',
-			};
+			// On Linux (including WSL) the Copilot CLI's default PTY-backed shell cannot
+			// start inside the MXC bubblewrap sandbox because the MXC binaries
+			// (`@microsoft/mxc-sdk`) are only present in the VS Code host-agent distribution,
+			// not in a standalone extension's node_modules. Without the sandbox engine the
+			// shell tool hangs and eventually times out. Setting SHELL_SPAWN_BACKEND forces
+			// the CLI to use a non-sandboxed pipe-based spawn for each shell command, which
+			// works correctly in both native Linux and WSL. The VS Code host agent sets the
+			// same flag on Linux for the same reason (see copilotAgent.ts `_ensureClient`).
+			const env: Record<string, string | undefined> | undefined =
+				process.platform === 'linux'
+					? {
+						...process.env,
+						COPILOT_CLI_ENABLED_FEATURE_FLAGS: [
+							...(process.env['COPILOT_CLI_ENABLED_FEATURE_FLAGS'] ?? '').split(',').map(f => f.trim()).filter(Boolean),
+							'SHELL_SPAWN_BACKEND',
+						].join(','),
+					  }
+					: undefined;
 
-			log('starting CopilotClient', { restrictedTelemetry, baseDirectory: this.storagePath });
+			log('starting CopilotClient', { restrictedTelemetry, baseDirectory: this.storagePath, platform: process.platform, shellSpawnBackend: process.platform === 'linux' });
 			this._client = new CopilotClient({
 				gitHubToken: githubToken,
 				baseDirectory: this.storagePath,
@@ -367,6 +386,41 @@ export class CopilotParticipant {
 			await this._client.start();
 			log('CopilotClient started');
 		}
+	}
+
+	/**
+	 * SDK-native BYOK provider+model config that routes this session's model calls
+	 * to our localhost OpenAI-Completions proxy → VS Code LM.
+	 *
+	 * Mirrors the VS Code host agent's `resolveByokSessionConfig` exactly, except
+	 * we use `wireApi:'responses'` (OpenAI Responses format) because that is what
+	 * our existing `responsesProxy` speaks — the same proxy that already backs the
+	 * Codex participant.
+	 *
+	 * The participant vendor is 'copilot' (the VS Code LM vendor for Copilot-exposed models).
+	 * The nonce + sessionId bearer token matches the proxy's auth check.
+	 *
+	 * NOTE: the env-var BYOK path (COPILOT_PROVIDER_*) is only read by the standalone
+	 * `copilot` CLI binary, NOT by the SDK-spawned runtime — confirmed by inspecting
+	 * the SDK dist (zero references). The correct mechanism for the SDK-spawned runtime
+	 * is SessionConfig.providers/models, as used by the VS Code host agent.
+	 */
+	private _byokSessionConfig(sessionId: string, modelId: string): { providers: NamedProviderConfig[]; models: ProviderModelConfig[] } {
+		const info = this.proxyManager.info;
+		const vendor = 'copilot';
+		return {
+			providers: [{
+				name: vendor,
+				type: 'openai',
+				wireApi: 'responses',
+				baseUrl: info.responsesUrl,
+				bearerToken: `${info.responsesNonce}.${sessionId}`,
+			}],
+			models: [{
+				id: modelId,
+				provider: vendor,
+			}],
+		};
 	}
 
 	dispose(): void {

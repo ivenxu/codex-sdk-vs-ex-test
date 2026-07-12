@@ -885,3 +885,202 @@ export function createResponsesModelsHandler(): RouteHandler {
 		});
 	};
 }
+
+// ---------------------------------------------------------------------------
+// OpenAI Chat Completions handler  POST /v1/chat/completions
+// ---------------------------------------------------------------------------
+// Used by the Copilot CLI runtime when SessionConfig.providers[] specifies
+// type:'openai' + wireApi:'completions'. The Completions wire format uses
+// messages[] (role/content) — structurally compatible with convertInputToMessages
+// after wrapping as ResponsesMessageItems.
+// ---------------------------------------------------------------------------
+
+interface CompletionsMessage {
+	role: 'system' | 'user' | 'assistant' | 'tool' | string;
+	content: string | Array<{ type: string; text?: string }> | null;
+	tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>;
+	tool_call_id?: string;
+	name?: string;
+}
+
+interface CompletionsRequest {
+	model: string;
+	messages: CompletionsMessage[];
+	tools?: Array<{ type: string; function?: { name: string; description?: string; parameters?: object } }>;
+	tool_choice?: unknown;
+	stream?: boolean;
+	max_tokens?: number;
+	temperature?: number;
+	[key: string]: unknown;
+}
+
+/** Convert OpenAI Chat Completions messages[] → VS Code LM messages. */
+function convertCompletionsMessages(messages: CompletionsMessage[]): vscode.LanguageModelChatMessage[] {
+	const result: vscode.LanguageModelChatMessage[] = [];
+	const pendingToolResults = new Map<string, string>();
+
+	// First pass: collect tool results keyed by tool_call_id.
+	for (const m of messages) {
+		if (m.role === 'tool' && m.tool_call_id) {
+			pendingToolResults.set(m.tool_call_id, typeof m.content === 'string' ? m.content : '');
+		}
+	}
+
+	for (const m of messages) {
+		const textContent = typeof m.content === 'string'
+			? m.content
+			: Array.isArray(m.content)
+				? m.content.filter(p => p.type === 'text').map(p => p.text ?? '').join('')
+				: '';
+
+		if (m.role === 'tool') {
+			// Handled when the paired assistant message is processed.
+			continue;
+		}
+
+		if (m.role === 'assistant' && m.tool_calls?.length) {
+			const toolParts = m.tool_calls.map(tc => {
+				let args: object;
+				try { args = JSON.parse(tc.function.arguments) as object; } catch { args = {}; }
+				return new vscode.LanguageModelToolCallPart(tc.id, tc.function.name, args);
+			});
+			result.push(vscode.LanguageModelChatMessage.Assistant(toolParts));
+			// Emit matching tool results immediately after.
+			const resultParts = m.tool_calls
+				.map(tc => {
+					const out = pendingToolResults.get(tc.id);
+					return out !== undefined
+						? new vscode.LanguageModelToolResultPart(tc.id, [new vscode.LanguageModelTextPart(out)])
+						: null;
+				})
+				.filter((p): p is vscode.LanguageModelToolResultPart => p !== null);
+			if (resultParts.length > 0) {
+				result.push(vscode.LanguageModelChatMessage.User(resultParts));
+			}
+			continue;
+		}
+
+		if (m.role === 'user' || m.role === 'system' || m.role === 'developer') {
+			result.push(vscode.LanguageModelChatMessage.User(textContent || ' '));
+		} else if (m.role === 'assistant') {
+			result.push(vscode.LanguageModelChatMessage.Assistant(textContent || ' '));
+		}
+	}
+
+	// Ensure the conversation doesn't start with an Assistant message.
+	if (result.length > 0 && result[0].role !== 1 /* User */) {
+		result.unshift(vscode.LanguageModelChatMessage.User('(continuing)'));
+	}
+
+	return result;
+}
+
+/** Convert Completions API tools[] → VS Code LM tools. */
+function convertCompletionsTools(tools: CompletionsRequest['tools']): vscode.LanguageModelChatTool[] {
+	if (!tools) { return []; }
+	const out: vscode.LanguageModelChatTool[] = [];
+	for (const t of tools) {
+		if (t.type === 'function' && t.function?.name) {
+			out.push({
+				name: t.function.name,
+				description: t.function.description ?? '',
+				inputSchema: (t.function.parameters ?? {}) as Record<string, unknown>,
+			});
+		}
+	}
+	return out;
+}
+
+/** Stream VS Code LM response as OpenAI Chat Completions SSE. */
+async function streamCompletionsSSE(
+	res: http.ServerResponse,
+	vsResponse: vscode.LanguageModelChatResponse,
+	modelId: string,
+	token: vscode.CancellationToken,
+): Promise<void> {
+	const chatId = makeId('chatcmpl');
+	startSSE(res);
+
+	for await (const part of vsResponse.stream) {
+		if (token.isCancellationRequested) { break; }
+		if (part instanceof vscode.LanguageModelTextPart) {
+			writeSSEEvent(res, {
+				id: makeId('evt'),
+				object: 'chat.completion.chunk',
+				model: modelId,
+				choices: [{ index: 0, delta: { role: 'assistant', content: part.value }, finish_reason: null }],
+			});
+		} else if (part instanceof vscode.LanguageModelToolCallPart) {
+			writeSSEEvent(res, {
+				id: makeId('evt'),
+				object: 'chat.completion.chunk',
+				model: modelId,
+				choices: [{
+					index: 0,
+					delta: {
+						role: 'assistant',
+						content: null,
+						tool_calls: [{ index: 0, id: part.callId, type: 'function', function: { name: part.name, arguments: JSON.stringify(part.input) } }],
+					},
+					finish_reason: null,
+				}],
+			});
+		}
+	}
+
+	// Final DONE chunk.
+	writeSSEEvent(res, {
+		id: chatId,
+		object: 'chat.completion.chunk',
+		model: modelId,
+		choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+	});
+	res.write('data: [DONE]\n\n');
+	res.end();
+}
+
+export function createCompletionsHandler(): RouteHandler {
+	return async (req, res, body) => {
+		const r = body as CompletionsRequest;
+		console.log(`[completions-proxy] → POST /v1/chat/completions model=${r.model} stream=${r.stream !== false} msgs=${r.messages?.length ?? 0}`);
+
+		const models = await vscode.lm.selectChatModels({ id: r.model });
+		const model = models[0];
+		if (!model) {
+			writeJSON(res, 404, { error: { type: 'not_found_error', message: `Model '${r.model}' not found` } });
+			return;
+		}
+
+		const messages = convertCompletionsMessages(r.messages ?? []);
+		const tools = convertCompletionsTools(r.tools);
+		const options: vscode.LanguageModelChatRequestOptions = tools.length ? { tools } : {};
+
+		const cts = new vscode.CancellationTokenSource();
+		req.on('close', () => cts.cancel());
+
+		let vsResponse: vscode.LanguageModelChatResponse;
+		try {
+			vsResponse = await model.sendRequest(messages, options, cts.token);
+		} catch (err) {
+			writeJSON(res, 500, { error: { type: 'server_error', message: String(err) } });
+			return;
+		}
+
+		if (r.stream !== false) {
+			await streamCompletionsSSE(res, vsResponse, model.id, cts.token);
+		} else {
+			// Non-streaming: collect and return.
+			let text = '';
+			for await (const part of vsResponse.stream) {
+				if (part instanceof vscode.LanguageModelTextPart) { text += part.value; }
+			}
+			writeJSON(res, 200, {
+				id: makeId('chatcmpl'),
+				object: 'chat.completion',
+				model: model.id,
+				choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+				usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+			});
+		}
+	};
+}

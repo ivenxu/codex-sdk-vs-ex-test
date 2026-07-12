@@ -4,7 +4,7 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ProxyServer } from './proxyServer';
-import { createResponsesHandler, createResponsesModelsHandler } from './responsesProxy';
+import { createResponsesHandler, createResponsesModelsHandler, createCompletionsHandler } from './responsesProxy';
 import { createMessagesHandler, createMessagesCountTokensHandler, createMessagesModelsHandler } from './messagesProxy';
 
 export interface ProxyInfo {
@@ -30,6 +30,10 @@ export class ProxyManager {
 		this._responses = new ProxyServer();
 		this._responses.addRoute('POST', '/v1/responses', createResponsesHandler());
 		this._responses.addRoute('GET', '/v1/models', createResponsesModelsHandler());
+		// OpenAI Chat Completions wire — used by Copilot CLI runtime BYOK providers
+		// (type:'openai', wireApi:'completions') as confirmed by the VS Code host agent.
+		this._responses.addRoute('POST', '/v1/chat/completions', createCompletionsHandler());
+		this._responses.addRoute('POST', '/chat/completions', createCompletionsHandler());
 		// Also accept /responses without /v1/ prefix
 		this._responses.addRoute('POST', '/responses', createResponsesHandler());
 		this._responses.addRoute('GET', '/models', createResponsesModelsHandler());

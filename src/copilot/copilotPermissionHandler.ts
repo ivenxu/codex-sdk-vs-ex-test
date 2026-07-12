@@ -80,6 +80,7 @@ export class CopilotPermissionHandler {
 
 	private async _confirm(request: PermissionRequest, toolCallId: string): Promise<void> {
 		this.stream.progress('Waiting for approval…');
+		log('invoking vscode_get_confirmation', { toolCallId: toolCallId.slice(0, 13), kind: request.kind });
 		try {
 			const result = await vscode.lm.invokeTool(
 				'vscode_get_confirmation',
@@ -98,8 +99,11 @@ export class CopilotPermissionHandler {
 				? (firstPart as { value: unknown }).value
 				: undefined;
 			const approved = typeof rawValue === 'string' && rawValue.toLowerCase() === 'yes';
+			log('confirm result', { toolCallId: toolCallId.slice(0, 13), approved, rawValue });
 			this._pending.respondOrBuffer(toolCallId, approved);
-		} catch {
+		} catch (err) {
+			// Log the error clearly — don't silently deny.
+			log('confirm error (denying permission)', { toolCallId: toolCallId.slice(0, 13), error: String(err) });
 			this._pending.respondOrBuffer(toolCallId, false);
 		}
 	}
