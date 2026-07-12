@@ -177,7 +177,11 @@ export class ClaudeParticipant {
 				});
 			}
 		} catch (err) {
-			if (!token.isCancellationRequested) {
+			// Cancellation is expected — suppress noisy errors
+			const isCancellation = token.isCancellationRequested
+				|| (err instanceof TypeError && (err.message === 'terminated' || err.message.includes('aborted')))
+				|| (err instanceof Error && err.name === 'AbortError');
+			if (!isCancellation) {
 				logErr('query error', err);
 				stream.markdown(`\n\n> ⚠️ Claude error: ${String(err)}\n`);
 			}
@@ -248,7 +252,10 @@ export class ClaudeParticipant {
 				};
 			}
 		} catch (err) {
-			if (!token.isCancellationRequested) {
+			const isCancellation = token.isCancellationRequested
+				|| (err instanceof TypeError && (err.message === 'terminated' || err.message.includes('aborted')))
+				|| (err instanceof Error && err.name === 'AbortError');
+			if (!isCancellation) {
 				logErr('WarmQuery error', err);
 				stream.markdown(`\n\n> ⚠️ Claude error: ${String(err)}\n`);
 			}

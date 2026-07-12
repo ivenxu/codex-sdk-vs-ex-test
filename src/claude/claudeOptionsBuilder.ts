@@ -52,7 +52,8 @@ export interface OptionsBuilderInput {
 export function buildClaudeOptions(input: OptionsBuilderInput): Options {
 	const cwd = input.cwd ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 	const model = input.request.model.id;
-	const permissionMode = input.permissionMode ?? 'default';
+	const vendor = input.request.model.vendor;
+	const permissionMode = input.permissionMode ?? 'bypassPermissions';
 
 	const options: Options = {
 		cwd,
@@ -72,14 +73,21 @@ export function buildClaudeOptions(input: OptionsBuilderInput): Options {
 		enableFileCheckpointing: true,
 
 		// ── Model override ──
-		model,
+		// Encode vendor+id for precise proxy-side lookup. Format:
+		//   vendor/modelId  (e.g. "copilot/gpt-5.5")
+		// Falls back to id-only when vendor is unavailable.
+		model: vendor ? `${vendor}/${model}` : model,
 
 		// ── MCP servers (from caller, not config) ──
 		...(input.mcpServers ? { mcpServers: input.mcpServers as Options['mcpServers'] } : {}),
 
-		// ── Permission callback — the sole gate for all tool approvals ──
-		// allowDangerouslySkipPermissions tells the SDK to bypass its own
-		// internal permission rules and delegate EVERY decision to canUseTool.
+		// ── Permissions ──
+		// permissionMode configures the SDK's internal permission infrastructure
+		// (Zod schemas that validate tool execution). allowDangerouslySkipPermissions
+		// delegates ALL actual decisions to canUseTool. Both are needed:
+		// permissionMode sets up the right execution path, allowDangerouslySkip...
+		// ensures canUseTool is the sole authority for allow/deny.
+		permissionMode,
 		allowDangerouslySkipPermissions: true,
 		canUseTool: makeCanUseTool(input.request, input.token, permissionMode),
 
@@ -95,11 +103,14 @@ export function buildClaudeOptions(input: OptionsBuilderInput): Options {
 /**
  * Create the `canUseTool` callback for the SDK.
  *
+ * Uses `vscode.lm.invokeTool('vscode_get_confirmation', ...)` to show an
+ * inline approval in the chat panel — matching the Codex participant pattern.
+ *
  * Permission mode affects behavior:
- *   'default'        → prompt user via vscode_get_confirmation
+ *   'default'           → prompt user via native chat confirmation dialog
  *   'bypassPermissions' → auto-allow (no prompt)
- *   'dontAsk'        → auto-deny (no prompt)
- *   'acceptEdits'    → auto-allow file edit tools, prompt for others
+ *   'dontAsk'           → auto-deny (no prompt)
+ *   'acceptEdits'       → auto-allow file edit tools, prompt for others
  */
 function makeCanUseTool(
 	request: vscode.ChatRequest,
@@ -121,25 +132,22 @@ function makeCanUseTool(
 			return { behavior: 'allow' as const };
 		}
 
-		// Default: prompt via VS Code confirmation dialog
+		// Default: prompt via native chat confirmation (inline in chat panel)
 		try {
 			const result = await vscode.lm.invokeTool(
 				'vscode_get_confirmation',
 				{
 					input: {
-						title: 'Claude Code — Allow tool?',
-						message: `**Tool:** \`${toolName}\``,
+						title: 'Allow tool execution?',
+						message: `Claude wants to use: **${toolName}**`,
 						confirmationType: 'basic',
 					},
 					toolInvocationToken: request.toolInvocationToken,
 				},
 				token,
 			);
-			const firstPart = result.content.at(0);
-			const rawValue: unknown = firstPart != null && typeof firstPart === 'object' && 'value' in firstPart
-				? (firstPart as { value: unknown }).value
-				: undefined;
-			return typeof rawValue === 'string' && rawValue.toLowerCase() === 'yes'
+			const v = (result.content.at(0) as { value?: unknown } | undefined)?.value;
+			return typeof v === 'string' && v.toLowerCase() === 'yes'
 				? { behavior: 'allow' as const }
 				: { behavior: 'deny' as const, message: 'Denied by user' };
 		} catch {
@@ -159,28 +167,15 @@ function makeOnElicitation(
 		console.log('[claude] onElicitation', { mode: req.mode });
 
 		try {
-			const result = await vscode.lm.invokeTool(
-				'vscode_get_confirmation',
-				{
-					input: {
-						title: 'MCP Server Elicitation Request',
-						message: req.message ?? 'An MCP server is requesting user input.',
-						confirmationType: 'basic',
-					},
-					toolInvocationToken: request.toolInvocationToken,
-				},
-				token,
+			const result = await vscode.window.showInformationMessage(
+				'MCP Server Elicitation Request',
+				{ modal: true, detail: req.message ?? 'An MCP server is requesting user input.' },
+				'Accept',
+				'Cancel',
 			);
-			const firstPart = result.content.at(0);
-			const rawValue: unknown = firstPart != null && typeof firstPart === 'object' && 'value' in firstPart
-				? (firstPart as { value: unknown }).value
-				: undefined;
-			const accepted = typeof rawValue === 'string' && rawValue.toLowerCase() === 'yes';
-
-			if (accepted) {
-				return { action: 'accept' as const };
-			}
-			return { action: 'cancel' as const };
+			return result === 'Accept'
+				? { action: 'accept' as const }
+				: { action: 'cancel' as const };
 		} catch {
 			return { action: 'cancel' as const };
 		}

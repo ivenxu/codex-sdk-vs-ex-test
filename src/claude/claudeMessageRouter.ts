@@ -27,8 +27,14 @@ import type { NonNullableUsage } from '@anthropic-ai/claude-agent-sdk';
 export interface RouterState {
 	/** Current thinking block being streamed (id → text), null if none active */
 	currentThinkingId: string | null;
+	/** Accumulated thinking text for the current thinking block */
+	thinkingText: string;
+	/** Current tool display thinking block id, null if none active */
+	currentToolThinkingId: string | null;
 	/** Map of active tool call id → tool name */
 	activeToolCalls: Map<string, string>;
+	/** Set of file paths already reported via codeblockUri (dedup) */
+	reportedFilePaths: Set<string>;
 	/** Ordered list of file changes made this turn */
 	fileChanges: FileChangeEntry[];
 	/** Cumulative usage accumulated across stream events */
@@ -50,6 +56,9 @@ export interface FileChangeEntry {
 function createInitialState(): RouterState {
 	return {
 		currentThinkingId: null,
+		thinkingText: '',
+		currentToolThinkingId: null,
+		reportedFilePaths: new Set(),
 		activeToolCalls: new Map(),
 		fileChanges: [],
 		usage: null,
@@ -134,26 +143,42 @@ function handleContentBlockStart(
 
 	switch (block.type) {
 		case 'thinking': {
-			// Thinking block started → show thinking progress
-			state.currentThinkingId = crypto.randomUUID();
-			stream.thinkingProgress!({ id: state.currentThinkingId, text: 'Thinking…' });
+			// Reuse the same thinking block ID across the entire turn to avoid
+			// flickering — the model emits many tiny thinking blocks and each
+			// new ID resets the display to "Thinking…" visually.
+			if (!state.currentThinkingId) {
+				state.currentThinkingId = crypto.randomUUID();
+				stream.thinkingProgress!({ id: state.currentThinkingId, text: 'Thinking…' });
+			}
+			// Reset accumulated text for this new thinking block
+			state.thinkingText = '';
 			break;
 		}
 
 		case 'tool_use': {
-			// Tool call started → show progress with tool name
+			// Tool call started → display as a thinking block in the chat.
 			const toolName = block.name;
 			const toolId = block.id;
 			state.activeToolCalls.set(toolId, toolName);
-			stream.progress(`Calling ${toolName}…`);
 
-			// Detect file-edit tools for file change visibility (Priority 3b)
+			// Close any prior tool thinking block before opening a new one
+			if (state.currentToolThinkingId) {
+				state.currentToolThinkingId = null;
+			}
+			state.currentToolThinkingId = crypto.randomUUID();
+			stream.thinkingProgress!({ id: state.currentToolThinkingId, text: `🔧 ${toolName}` });
+
+			// Track file changes for VS Code's "N files changed" summary.
+			// codeblockUri (chatParticipantAdditions proposal) marks files as
+			// edited and triggers the file-changes UI in the chat panel.
 			if (isFileEditTool(toolName)) {
+				const filePath = extractPathFromToolInput(block.input as Record<string, unknown>);
 				state.fileChanges.push({
-					path: extractPathFromToolInput(block.input as Record<string, unknown>),
+					path: filePath,
 					operation: toolName === 'Edit' ? 'edit' : 'create',
 					description: `Editing via ${toolName}`,
 				});
+				_markFileEdited(stream, state, filePath);
 			}
 			break;
 		}
@@ -193,9 +218,12 @@ function handleContentBlockDelta(
 		}
 
 		case 'thinking_delta': {
-			// Thinking delta → update thinking progress
+			// Thinking delta → accumulate and re-emit full text so far.
+			// VS Code thinkingProgress replaces the displayed text (doesn't append),
+			// so we must send the full accumulated string each time.
 			if (delta.thinking && state.currentThinkingId) {
-				stream.thinkingProgress!({ id: state.currentThinkingId, text: delta.thinking });
+				state.thinkingText += delta.thinking;
+				stream.thinkingProgress!({ id: state.currentThinkingId, text: state.thinkingText });
 			}
 			break;
 		}
@@ -217,14 +245,9 @@ function handleContentBlockStop(
 	stream: vscode.ChatResponseStream,
 	state: RouterState,
 ): RouterState {
-	// If we were tracking a thinking block, clear it
-	if (state.currentThinkingId !== null) {
-		state.currentThinkingId = null;
-	}
-
-	// If we were tracking a tool_use block, mark it complete
-	// (We don't know the toolUseId here, but activeToolCalls is keyed by it)
-	// We'll match by index or clear stale ones on user messages
+	// Preserve the thinking block ID across blocks — clearing it causes
+	// the chat UI to start a fresh "Thinking…" label on the next block,
+	// which creates ugly flickering. Only clear on turn completion.
 	return state;
 }
 
@@ -315,8 +338,19 @@ function handleUserMessage(
 	stream: vscode.ChatResponseStream,
 	state: RouterState,
 ): RouterState {
-	// User messages carry tool results from the SDK
-	// Display tool results as they complete
+	// User messages carry tool results from the SDK.
+	// Update the tool thinking block to show completion status.
+	if (state.currentToolThinkingId) {
+		const toolNames = Array.from(state.activeToolCalls.values());
+		if (toolNames.length > 0) {
+			stream.thinkingProgress!({
+				id: state.currentToolThinkingId,
+				text: `✅ ${toolNames.join(', ')}`,
+			});
+		}
+		state.currentToolThinkingId = null;
+	}
+
 	if (msg.session_id) {
 		state.sessionId = msg.session_id;
 	}
@@ -374,6 +408,28 @@ function extractPathFromToolInput(input: Record<string, unknown>): string {
 	if (typeof input.path === 'string') { return input.path; }
 	if (typeof input.filePath === 'string') { return input.filePath; }
 	return 'unknown';
+}
+
+/**
+ * Report a file path as edited to the VS Code chat stream.
+ * Uses the `codeblockUri` method from the `chatParticipantAdditions` proposal
+ * to trigger the "N files changed" summary panel in the chat UI.
+ */
+function _markFileEdited(
+	stream: vscode.ChatResponseStream,
+	state: RouterState,
+	filePath: string,
+): void {
+	if (!filePath || filePath === 'unknown') { return; }
+	if (state.reportedFilePaths.has(filePath)) { return; }
+	state.reportedFilePaths.add(filePath);
+	try {
+		// ChatResponseStream.codeblockUri is from the chatParticipantAdditions proposal
+		(stream as unknown as { codeblockUri(uri: vscode.Uri, isEdit?: boolean): void })
+			.codeblockUri(vscode.Uri.file(filePath), true);
+	} catch {
+		// codeblockUri may not be available — silently fall back
+	}
 }
 
 export { createInitialState };
