@@ -99,6 +99,23 @@
 						},
 						"additionalProperties": true
 					}
+				},
+				"copilotcli.mcpServers": {
+					"type": "object",
+					"default": {},
+					"description": "MCP server configuration for the Copilot CLI participant. Each key is a server name; values must have either `command` (stdio) or `url` (HTTP/SSE). Auto-discovery of .mcp.json and .vscode/mcp.json in the workspace is always on.",
+					"additionalProperties": {
+						"type": "object",
+						"properties": {
+							"command": { "type": "string", "description": "Executable to spawn (stdio servers)." },
+							"args": { "type": "array", "items": { "type": "string" }, "description": "Arguments for the command." },
+							"env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment variables for the server process." },
+							"workingDirectory": { "type": "string", "description": "Working directory for the server process." },
+							"url": { "type": "string", "description": "Server URL (HTTP/SSE servers)." },
+							"headers": { "type": "object", "additionalProperties": { "type": "string" }, "description": "HTTP headers for remote servers." }
+						},
+						"additionalProperties": true
+					}
 				}
 			}
 		}

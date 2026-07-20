@@ -1,14 +1,17 @@
 import * as vscode from 'vscode';
 import {
+	BuiltInTools,
 	CopilotClient,
 	RuntimeConnection,
 	type SessionConfig,
 	type ResumeSessionConfig,
 	type NamedProviderConfig,
 	type ProviderModelConfig,
+	type MCPServerConfig,
 	type PermissionRequestResult,
 	type ExitPlanModeRequest,
 	type ExitPlanModeResult,
+	type Tool,
 } from '@github/copilot-sdk';
 import { createInitialRouterState, routeSessionEvent, type RouterState } from './copilot/copilotSessionEventRouter';
 import { CopilotPermissionHandler } from './copilot/copilotPermissionHandler';
@@ -172,6 +175,16 @@ export class CopilotParticipant {
 					: 'interactive';
 		const prompt = slash.command ? slash.rest : request.prompt;
 
+		// Safety timeout: if the model doesn't start responding within 120s
+		// (hasOutput stays false), resolve the idle so the turn doesn't hang forever.
+		const TURN_TIMEOUT_MS = 120_000;
+		const timeoutHandle = setTimeout(() => {
+			if (!routerState.hasOutput && !routerState.completed) {
+				logErr('turn timed out waiting for model output', { sessionId: entry.sessionId });
+				resolveIdle();
+			}
+		}, TURN_TIMEOUT_MS);
+
 		log('starting turn', {
 			sessionId: entry.sessionId,
 			agentMode,
@@ -197,6 +210,7 @@ export class CopilotParticipant {
 			logErr('turn failed', err);
 			stream.markdown(`\n\n> ⚠️ Copilot error: ${err instanceof Error ? err.message : String(err)}\n`);
 		} finally {
+			clearTimeout(timeoutHandle);
 			cancelSub.dispose();
 			permission.dispose();
 			entry.current = null;
@@ -240,6 +254,14 @@ export class CopilotParticipant {
 					workingDirectory: workspaceCwd(),
 					streaming: true,
 					...byok,
+					// VS Code tools: additive — updates the tool list for the resumed session.
+					tools: buildVsCodeTools(),
+					// MCP fields intentionally OMITTED on resume:
+					// - mcpServers: {} (empty) on resume tells the runtime to REPLACE the server
+					//   list with nothing, clearing any MCP servers started at creation time.
+					// - enableConfigDiscovery / enableMcpApps on resume trigger a re-init scan
+					//   that can emit a premature session.idle, ending the turn with 0 tokens.
+					// The session's MCP config is already baked in from createSession.
 					onPermissionRequest: this._permissionCallback(entry),
 					onExitPlanModeRequest: this._exitPlanModeCallback(entry),
 				};
@@ -256,6 +278,10 @@ export class CopilotParticipant {
 		log('creating new session', { model: qualifiedModelId });
 		const entry = this._newEntry();
 		const byok = this._byokSessionConfig(/* sessionId unknown yet — use placeholder */ 'new', request.model.id);
+		const vsCodeTools = buildVsCodeTools();
+		const mcpServers = buildMcpServerConfig();
+		log('vscode tools registered', { count: vsCodeTools.length, names: vsCodeTools.slice(0, 10).map(t => t.name) });
+		log('mcp servers', { count: Object.keys(mcpServers).length, names: Object.keys(mcpServers) });
 		const createConfig: SessionConfig = {
 			workingDirectory: workspaceCwd(),
 			// Provider-qualified id ('copilot/gpt-4.1') tells the runtime to use the
@@ -264,6 +290,10 @@ export class CopilotParticipant {
 			model: qualifiedModelId,
 			streaming: true,
 			...byok,
+			tools: vsCodeTools,
+			mcpServers,
+			enableConfigDiscovery: true,
+			enableMcpApps: true,
 			onPermissionRequest: this._permissionCallback(entry),
 			onExitPlanModeRequest: this._exitPlanModeCallback(entry),
 		};
@@ -281,6 +311,19 @@ export class CopilotParticipant {
 		entry.sessionId = session.sessionId;
 		entry.unsubscribe = session.on((event) => {
 			const current = entry.current;
+			// Log every event for debugging — helps identify unexpected idles, missing
+			// model calls, and initialization sequences.
+			log(`event: ${event.type}`, { sessionId: entry.sessionId.slice(0, 8), hasCurrent: !!current });
+			if (event.type === 'external_tool.requested') {
+				// VS Code tool call — invoke via vscode.lm.invokeTool and feed result back.
+				void this._handleExternalTool(entry, event.data);
+				return;
+			}
+			if (event.type === 'session.shutdown' && event.data.shutdownType === 'error') {
+				// Fatal runtime crash — evict the session so the next message starts fresh.
+				log('session.shutdown error — evicting session', { sessionId: entry.sessionId, reason: event.data.errorReason });
+				this._sessions.delete(entry.sessionId);
+			}
 			if (current) {
 				routeSessionEvent(event, current.stream, current.routerState, current.resolveIdle);
 			}
@@ -288,6 +331,49 @@ export class CopilotParticipant {
 		this._sessions.set(entry.sessionId, entry);
 		log('session ready', entry.sessionId);
 		return entry;
+	}
+
+	/**
+	 * Handles `external_tool.requested` events by invoking the named VS Code LM
+	 * tool and returning the result to the runtime via `session.rpc.tools.handlePendingToolCall`.
+	 *
+	 * Declaration-only SDK `Tool` objects (no `handler`) trigger this event when the
+	 * runtime wants to call a VS Code tool. Mirrors the host agent's `_createClientSdkTools`
+	 * pattern but without the workbench protocol layer.
+	 */
+	private async _handleExternalTool(
+		entry: SessionEntry,
+		data: { requestId: string; toolName: string; arguments?: Record<string, unknown>; toolCallId: string },
+	): Promise<void> {
+		const { requestId, toolName, arguments: args, toolCallId } = data;
+		const current = entry.current;
+		log('external_tool.requested', { requestId: requestId.slice(0, 13), toolName, toolCallId: toolCallId.slice(0, 13) });
+		try {
+			const result = await vscode.lm.invokeTool(
+				toolName,
+				{ input: args ?? {}, toolInvocationToken: current?.toolInvocationToken },
+				current?.token ?? new vscode.CancellationTokenSource().token,
+			);
+			const text = result.content
+				.map(part => {
+					if (part instanceof vscode.LanguageModelTextPart) { return part.value; }
+					if (typeof part === 'object' && part !== null && 'value' in part) { return String((part as { value: unknown }).value); }
+					return '';
+				})
+				.join('');
+			log('external_tool result', { requestId: requestId.slice(0, 13), toolName, len: text.length });
+			await entry.session.rpc.tools.handlePendingToolCall({
+				requestId,
+				result: { textResultForLlm: text || '(empty)', resultType: 'success' },
+			});
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			logErr(`external_tool failed: ${toolName}`, err);
+			await entry.session.rpc.tools.handlePendingToolCall({
+				requestId,
+				error: message,
+			}).catch(() => { /* best-effort */ });
+		}
 	}
 
 	/** Stable permission callback that delegates to the current turn's handler. */
@@ -477,4 +563,90 @@ function findSessionIdInHistory(
 		}
 	}
 	return undefined;
+}
+
+/**
+ * Enumerate all VS Code Language Model tools and return them as declaration-only
+ * SDK `Tool` objects (no `handler`). Without a handler the runtime fires
+ * `external_tool.requested` events when it wants to call one, which we handle
+ * in `_handleExternalTool` via `vscode.lm.invokeTool`. This is the participant
+ * equivalent of the host agent's `_createClientSdkTools()`.
+ *
+ * `skipPermission: true` because the Copilot permission handler would require an
+ * approval dialog for every VS Code tool call; VS Code's own tool invocation
+ * security model governs access instead.
+ */
+/** SDK-reserved built-in tool names that must NOT be registered as VS Code tools.
+ * These are the Copilot CLI's own internal dispatchers (skill, subagent, …).
+ * Registering a VS Code LM tool with the same name would override them and break
+ * features like MCP skill invocation, even with overridesBuiltInTool: true.
+ */
+const COPILOT_BUILTIN_TOOL_NAMES = new Set<string>([
+	...BuiltInTools.Isolated,
+]);
+
+function buildVsCodeTools(): Tool[] {
+	const tools = vscode.lm.tools ?? [];
+	const filtered = tools.filter(t => !COPILOT_BUILTIN_TOOL_NAMES.has(t.name));
+	const skipped = tools.length - filtered.length;
+	if (skipped > 0) {
+		log('buildVsCodeTools: skipped built-in name collisions', { skipped, names: tools.filter(t => COPILOT_BUILTIN_TOOL_NAMES.has(t.name)).map(t => t.name) });
+	}
+	return filtered.map(t => ({
+		name: t.name,
+		description: t.description ?? '',
+		parameters: (t.inputSchema as Record<string, unknown> | undefined) ?? { type: 'object', properties: {} },
+		skipPermission: true,
+		// Some VS Code LM tools share names with non-isolated Copilot CLI built-ins.
+		// The SDK requires this flag when a name collides with a built-in; without it
+		// session.error fires with "conflicts with a built-in tool".
+		overridesBuiltInTool: true,
+	}));
+}
+
+/**
+ * Build MCP server config from two sources, merged together:
+ *
+ *  1. `mcpServers` — VS Code's own top-level MCP setting (used by VS Code Chat
+ *     / GitHub Copilot extension). This is where most users configure servers.
+ *
+ *  2. `copilotcli.mcpServers` — Our extension-specific override. Entries here
+ *     take precedence over same-named entries from source 1, allowing users to
+ *     supply auth headers or alternative configs for servers already in source 1.
+ *
+ * Accepts either a stdio server (has `command`) or an HTTP/SSE server (has
+ * `url`); silently skips malformed entries. Returns an empty map when no
+ * servers are configured (the runtime will still auto-discover `.mcp.json`
+ * and `.vscode/mcp.json` in the workspace because we set `enableConfigDiscovery`).
+ */
+function buildMcpServerConfig(): Record<string, MCPServerConfig> {
+	// Source 1: global VS Code MCP setting used by VS Code Chat
+	const global = vscode.workspace.getConfiguration().get<Record<string, unknown>>('mcpServers') ?? {};
+	// Source 2: our extension-specific setting (higher priority)
+	const ours = vscode.workspace.getConfiguration('copilotcli').get<Record<string, unknown>>('mcpServers') ?? {};
+	// Merge — ours wins on conflict
+	const merged: Record<string, unknown> = { ...global, ...ours };
+
+	const result: Record<string, MCPServerConfig> = {};
+	for (const [name, server] of Object.entries(merged)) {
+		if (!server || typeof server !== 'object') { continue; }
+		const s = server as Record<string, unknown>;
+		if (typeof s['command'] === 'string') {
+			result[name] = {
+				type: 'stdio',
+				command: s['command'],
+				...(Array.isArray(s['args']) ? { args: s['args'] as string[] } : {}),
+				...(s['env'] && typeof s['env'] === 'object' ? { env: s['env'] as Record<string, string> } : {}),
+				...(typeof s['workingDirectory'] === 'string' ? { workingDirectory: s['workingDirectory'] } : {}),
+			};
+		} else if (typeof s['url'] === 'string') {
+			result[name] = {
+				type: 'http',
+				url: s['url'],
+				...(s['headers'] && typeof s['headers'] === 'object' ? { headers: s['headers'] as Record<string, string> } : {}),
+			};
+		}
+		// Silently skip entries with neither command nor url.
+	}
+	return result;
 }

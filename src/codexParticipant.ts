@@ -444,15 +444,15 @@ export class CodexParticipant {
 		let thinkingOpen = false;
 		ts.on('item/reasoning/summaryPartAdded', () => {
 			thinkingOpen = true;
-			stream.thinkingProgress!({ id: 'reasoning', text: 'Thinking…' });
+			stream.thinkingProgress?.({ id: 'reasoning', text: 'Thinking…' });
 		});
 		ts.on('item/reasoning/summaryTextDelta', (p: ReasoningSummaryTextDeltaNotification) => {
-			if (!thinkingOpen) { stream.thinkingProgress!({ id: 'reasoning', text: 'Thinking…' }); thinkingOpen = true; }
-			stream.thinkingProgress!({ id: p.itemId, text: p.delta });
+			if (!thinkingOpen) { stream.thinkingProgress?.({ id: 'reasoning', text: 'Thinking…' }); thinkingOpen = true; }
+			stream.thinkingProgress?.({ id: p.itemId, text: p.delta });
 		});
 		ts.on('item/reasoning/textDelta', (p: ReasoningTextDeltaNotification) => {
-			if (!thinkingOpen) { stream.thinkingProgress!({ id: 'reasoning', text: 'Thinking…' }); thinkingOpen = true; }
-			stream.thinkingProgress!({ id: p.itemId, text: p.delta });
+			if (!thinkingOpen) { stream.thinkingProgress?.({ id: 'reasoning', text: 'Thinking…' }); thinkingOpen = true; }
+			stream.thinkingProgress?.({ id: p.itemId, text: p.delta });
 		});
 
 		let progressLabel = '';

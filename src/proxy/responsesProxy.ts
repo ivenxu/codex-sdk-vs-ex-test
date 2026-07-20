@@ -446,9 +446,58 @@ async function streamResponsesSSE(
 	writeSSEEvent(res, { type: 'response.created', response: baseResponse });
 	writeSSEEvent(res, { type: 'response.in_progress', response: baseResponse });
 
-	// Open the message output item
+	// Reasoning item comes BEFORE the message item (output_index 0) so the
+	// SDK's SSE parser sees it as a properly wrapped `reasoning` output.
 	let outputIndex = 0;
-	const msgOutputIndex = outputIndex;
+	const reasoningOutputIndex = outputIndex++;
+	const reasoningItemId = makeId('rs');
+	let reasoningItemOpen = false;
+	let reasoningAccumulatedText = '';
+	let reasoningContentIndex = 0;
+
+	const openReasoningItem = () => {
+		if (reasoningItemOpen) { return; }
+		reasoningItemOpen = true;
+		writeSSEEvent(res, {
+			type: 'response.output_item.added',
+			output_index: reasoningOutputIndex,
+			item: { id: reasoningItemId, type: 'reasoning', status: 'in_progress', summary: [] },
+		});
+		writeSSEEvent(res, {
+			type: 'response.content_part.added',
+			item_id: reasoningItemId,
+			output_index: reasoningOutputIndex,
+			content_index: 0,
+			part: { type: 'reasoning_summary_text', text: '' },
+		});
+	};
+
+	const closeReasoningItem = () => {
+		if (!reasoningItemOpen) { return; }
+		reasoningItemOpen = false;
+		writeSSEEvent(res, {
+			type: 'response.reasoning_summary_text.done',
+			item_id: reasoningItemId,
+			output_index: reasoningOutputIndex,
+			content_index: 0,
+			text: reasoningAccumulatedText,
+		});
+		writeSSEEvent(res, {
+			type: 'response.content_part.done',
+			item_id: reasoningItemId,
+			output_index: reasoningOutputIndex,
+			content_index: 0,
+			part: { type: 'reasoning_summary_text', text: reasoningAccumulatedText },
+		});
+		writeSSEEvent(res, {
+			type: 'response.output_item.done',
+			output_index: reasoningOutputIndex,
+			item: { id: reasoningItemId, type: 'reasoning', status: 'completed', summary: [{ type: 'reasoning_summary_text', text: reasoningAccumulatedText }] },
+		});
+	};
+
+	// Message item (output_index 1+)
+	const msgOutputIndex = outputIndex++;
 	writeSSEEvent(res, {
 		type: 'response.output_item.added',
 		output_index: msgOutputIndex,
@@ -492,15 +541,8 @@ async function streamResponsesSSE(
 		});
 	};
 
-	// Track reasoning item state
-	let reasoningItemId: string | null = null;
-	let reasoningOutputIndex = 0;
-	let reasoningSummaryIndex = 0;
-	let reasoningContentIndex = 0;
-
 	// Track tool call output items
 	const toolCallItems: Array<{ id: string; call_id: string; name: string; arguments: string; output_index: number }> = [];
-	outputIndex++; // tool calls start at outputIndex 1+
 
 	let usageInputTokens = 0;
 	let usageOutputTokens = 0;
@@ -579,19 +621,26 @@ async function streamResponsesSSE(
 					} catch { /* ignore */ }
 				}
 			} else if (isThinking) {
-				// Forward thinking parts as reasoning content deltas.
-				// Codex's SSE parser REQUIRES `content_index` in
-				// `response.reasoning_text.delta` — without it the
-				// event is silently dropped (codex-api/src/sse/responses.rs:351).
+				// Forward thinking parts as reasoning summary text deltas.
+				// The SDK's SSE parser maps these to `assistant.reasoning_delta`
+				// only when they are wrapped in a proper `reasoning` output item
+				// (response.output_item.added type=reasoning) with item_id and
+				// output_index.  A bare `response.reasoning_text.delta` without
+				// a parent item is silently routed to `assistant.streaming_delta`.
 				const thinkingPart = part as { value?: string };
 				const thinkingText = thinkingPart.value ?? '';
 				if (thinkingText) {
-					console.log(`[responses-proxy] reasoning_text.delta ci=${reasoningContentIndex}:`, thinkingText.slice(0, 80));
+					openReasoningItem();
+					reasoningAccumulatedText += thinkingText;
+					console.log(`[responses-proxy] reasoning_summary_text.delta ci=${reasoningContentIndex}:`, thinkingText.slice(0, 80));
 					writeSSEEvent(res, {
-						type: 'response.reasoning_text.delta',
+						type: 'response.reasoning_summary_text.delta',
+						item_id: reasoningItemId,
+						output_index: reasoningOutputIndex,
+						content_index: 0,
 						delta: thinkingText,
-						content_index: reasoningContentIndex++,
 					});
+					reasoningContentIndex++;
 				}
 			}
 		}
@@ -601,7 +650,8 @@ async function streamResponsesSSE(
 	}
 	console.log(`[responses-proxy] stream iteration done, total parts=${partCount ?? 0}`);
 
-	// Phase 3: Close message item
+	// Phase 3: Close reasoning + message items
+	closeReasoningItem();
 	closeTextContent();
 
 	// If there was a stream error, send a failed response
@@ -644,6 +694,9 @@ async function streamResponsesSSE(
 
 	// Final response.completed
 	const finalOutput: unknown[] = [];
+	if (reasoningAccumulatedText) {
+		finalOutput.push({ id: reasoningItemId, type: 'reasoning', status: 'completed', summary: [{ type: 'reasoning_summary_text', text: reasoningAccumulatedText }] });
+	}
 	if (accumulatedText) {
 		finalOutput.push({ id: messageItemId, type: 'message', status: 'completed', role: 'assistant', content: outputContent });
 	}

@@ -27,30 +27,38 @@ instead of being limited to CAPI.
 │            └── { session, sequencer, current, unsubscribe }  │
 │                one warm SDK session per conversation         │
 │                                                              │
-│  _lastToken / _lastProxyEnabled                              │
-│            └── trigger a client restart when they change     │
+│  _lastToken  →  triggers client restart on token rotation    │
 └──────────────┬───────────────────────────────────────────────┘
-               │
-               │  (optional, when copilotcli.modelProxy.enabled)
-               │  env: COPILOT_API_URL = http://127.0.0.1:N
-               │       GITHUB_COPILOT_API_TOKEN = nonce
-               │       COPILOT_CLI_DISABLE_WEBSOCKET_RESPONSES = true
+               │  per session: SessionConfig.providers / models
+               │  type:'openai', wireApi:'responses',
+               │  bearerToken: nonce.sessionId
+               │  model: 'copilot/<picked-model>'
                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│  Responses Proxy (src/proxy/responsesProxy.ts)              │
+│  Responses Proxy  (src/proxy/responsesProxy.ts)             │
 │  OpenAI Responses API ←→ VS Code LM API                     │
-│  Selects model by request body id (selectChatModels({ id })) │
+│  selectChatModels({ id }) picks the model per request        │
 └──────────────┬───────────────────────────────────────────────┘
                │
                ▼
 ┌──────────────────────────────────────────────────────────────┐
 │  @github/copilot-sdk  →  @github/copilot runtime (stdio RPC) │
 │  client.start()          spawns ONE subprocess               │
-│  createSession({model})  warm, disk-backed session           │
+│  createSession({                                             │
+│    model, tools:[vsCodeTools...],                            │
+│    mcpServers, enableConfigDiscovery, enableMcpApps          │
+│  })                                                          │
 │  session.send({...})     multi-turn, history preserved       │
 │  session.on(handler)     ~80 typed SessionEvents             │
+│    external_tool.requested → _handleExternalTool             │
+│    other events           → routeSessionEvent               │
 │  session.abort()         cancel the in-flight turn           │
 └──────────────────────────────────────────────────────────────┘
+               │  auto-discovery (enableConfigDiscovery: true)
+               │  .mcp.json, .vscode/mcp.json
+               │
+               ▼
+               MCP servers (stdio/http) started and managed by runtime
 ```
 
 **Auth**: the GitHub Copilot token is passed directly as
@@ -325,6 +333,100 @@ Other slash commands:
 
 ---
 
+## 10. VS Code Tool Integration
+
+### How it works
+
+The SDK `SessionConfig.tools` field accepts `Tool[]` objects. A tool with a
+`handler` function executes client-side when called. A tool **without** a handler
+is *declaration-only* — the runtime advertises it to the model, and when the
+model calls it the runtime fires an `external_tool.requested` session event
+instead of running a handler. The participant then:
+
+1. receives the event (via `session.on`),
+2. calls `vscode.lm.invokeTool(toolName, { input: args })`,
+3. returns the result to the runtime via `session.rpc.tools.handlePendingToolCall`.
+
+```
+buildVsCodeTools()  ←  vscode.lm.tools  (all registered LM tools)
+        ↓ Tool[] with no handler, skipPermission: true
+createSession / resumeSession  ←  tools: vsCodeTools
+        ↓ runtime advertises tools to model
+model calls "vscode_readFile"
+        ↓ external_tool.requested event { requestId, toolName, arguments }
+_handleExternalTool(entry, data)
+        ↓ vscode.lm.invokeTool(toolName, { input: args, toolInvocationToken })
+        ↓ session.rpc.tools.handlePendingToolCall({ requestId, result })
+model receives tool result
+```
+
+### Key differences from the host agent
+
+| | Host agent | Our participant |
+|---|---|---|
+| **Tool source** | `_createClientSdkTools()` from `ActiveClientToolSet` (workbench-registered tools across all client connections) | `buildVsCodeTools()` from `vscode.lm.tools` (same tools, no protocol layer) |
+| **Tool execution** | `handler` parks in `_pendingClientToolCalls` registry → waits for `handleClientToolCallComplete` over agent-host protocol | `_handleExternalTool` calls `vscode.lm.invokeTool` directly |
+| **Permission** | tool calls routed through workbench approval pipeline | `skipPermission: true` — VS Code's own tool security model governs |
+| **Shell tools** | `createShellTools(shellManager, ...)` with optional MXC sandbox | CLI built-in bash (`SHELL_SPAWN_BACKEND` on Linux) |
+| **Server tools** | `_createServerSdkTools()` from `IAgentServerToolHost` | Not wired (review, checkpoint, etc. are agent-host-only) |
+| **Plugin dirs** | `pluginDirectories`, `skillDirectories`, `instructionDirectories` | Not wired (SDK auto-discovers via `enableConfigDiscovery` if needed) |
+
+### Why `skipPermission: true`
+
+The Copilot permission handler (`CopilotPermissionHandler`) would intercept every
+tool call and show an approval dialog. VS Code tools already have their own
+security model: `vscode.lm.invokeTool` enforces the tool's own access controls
+and asks for confirmation where appropriate. Adding a second layer via
+`onPermissionRequest` would double-prompt and block all tool calls.
+
+---
+
+## 11. MCP Server Integration
+
+### What we implement (matching the host agent)
+
+Every `createSession` / `resumeSession` call sets three MCP-related fields:
+
+```typescript
+{
+    mcpServers:           buildMcpServerConfig(),  // from copilotcli.mcpServers setting
+    enableConfigDiscovery: true,                   // auto-discovers .mcp.json in cwd
+    enableMcpApps:        true,                    // enables MCP App iframe feature
+}
+```
+
+### Three MCP server sources
+
+| Source | Mechanism | Description |
+|---|---|---|
+| **Workspace setting** | `copilotcli.mcpServers` → `buildMcpServerConfig()` | Explicit stdio/HTTP servers declared in VS Code settings |
+| **Auto-discovery** | `enableConfigDiscovery: true` | Runtime scans `workingDirectory` for `.mcp.json`, `.vscode/mcp.json` at session start |
+| **MCP Apps** | `enableMcpApps: true` | Experimental MCP App iframes (SEP-1865) |
+
+### `copilotcli.mcpServers` setting shape
+
+```jsonc
+// settings.json
+"copilotcli.mcpServers": {
+  "my-tool": { "command": "npx", "args": ["-y", "@my/mcp-server"] },
+  "remote-tool": { "url": "https://my-mcp-server/sse" }
+}
+```
+
+`buildMcpServerConfig()` silently skips entries that have neither `command` nor
+`url`, matching the host agent's `toSdkMcpServersFromConfigMap` validation.
+
+### Differences from the host agent
+
+| | Host agent | Our participant |
+|---|---|---|
+| **Settings key** | `copilot.mcpServers` (root config via `AgentHostMcpServersConfigKey`) | `copilotcli.mcpServers` (workspace setting) |
+| **Plugin-contributed servers** | `toSdkMcpServers(plugins.flatMap(p => p.mcpServers))` — from `.github/mcp.json`, skill dirs | ❌ not wired (only explicit settings + auto-discovery) |
+| **Auth handler** | `onMcpAuthRequest` — OAuth flow routed through workbench | ❌ not in SDK 1.0.4 (`onMcpAuthRequest` absent) |
+| **Server status tracking** | Inventory polling + `mcpServer/startupStatus/updated` notifications | ❌ not wired (runtime manages internally) |
+
+---
+
 ## 11. Shell Tool on Linux / WSL: `SHELL_SPAWN_BACKEND`
 
 ### The problem
@@ -404,7 +506,9 @@ are caused by the model generating bad tool inputs:
 | **Approval** | async RPC + registry | sync `canUseTool` | async `onPermissionRequest` + registry |
 | **Cancellation** | `turn/interrupt` + await + timeout | `abortController.abort()` | `session.abort()` |
 | **Mode / autopilot** | `approvalPolicy` | `permissionMode` | `MessageOptions.agentMode` via slash commands |
-| **Model proxy** | env `proxyBaseUrl` → responses proxy | env `ANTHROPIC_BASE_URL` → messages proxy | env `COPILOT_API_URL` → responses proxy |
+| **VS Code tools** | `ActiveClientToolSet` → `_createClientSdkTools()` | in-process MCP server (`clientToolMcpServer.ts`) | `buildVsCodeTools()` → declaration-only SDK tools → `external_tool.requested` |
+| **MCP servers** | `copilot.mcpServers` setting + plugin `.github/mcp.json` + auto-discovery + OAuth | `claude.mcpServers` setting (via Claude SDK `Options.mcpServers`) | `copilotcli.mcpServers` setting + auto-discovery (`enableConfigDiscovery`) + `enableMcpApps` |
+| **Model proxy** | env `proxyBaseUrl` → responses proxy | env `ANTHROPIC_BASE_URL` → messages proxy | `SessionConfig.providers` → responses proxy |
 | **Model selection** | per turn (`startTurn({ model })`) | `Options.model` | per session (`createSession({ model })`) |
 | **Local state** | approval registries, turn promises | AbortControllers, WarmQuery handles | session map, per-turn permission registries |
 
@@ -414,7 +518,7 @@ are caused by the model generating bad tool inputs:
 
 | File | Lines | Purpose |
 |---|---|---|
-| `src/copilotParticipant.ts` | ~393 | Main participant: client + session map, turn sequencer, routing, proxy env, slash commands, cancellation, dispose |
+| `src/copilotParticipant.ts` | ~450 | Main participant: client + session map, turn sequencer, VS Code tool integration, routing, proxy env, slash commands, cancellation, dispose |
 | `src/copilot/copilotSessionEventRouter.ts` | ~143 | Pure function: SDK `SessionEvent` → VS Code chat stream actions |
 | `src/copilot/copilotPermissionHandler.ts` | ~111 | Tiered auto-approval + deferred registry keyed by `toolCallId` |
 | `src/copilot/copilotAttachments.ts` | ~61 | VS Code references → SDK `MessageOptions.attachments` (file + selection) |
